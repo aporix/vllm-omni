@@ -18,3 +18,70 @@ steps:
       queue: small_cpu_queue_release
     commands:
       - "bash .buildkite/scripts/generate-and-upload-nightly-index.sh"
+
+  - group: "Build release Docker images"
+    key: "build-release-images"
+    steps:
+      - label: "Build release image - x86_64"
+        key: build-release-image-x86
+        depends_on: ~
+        agents:
+          queue: cpu_queue_release
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - |
+            DOCKER_BUILDKIT=1 docker build \
+              --build-arg max_jobs=16 \
+              --tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) \
+              --progress plain \
+              -f docker/Dockerfile.cuda .
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)"
+          # re-tag to default image tag and push, just in case arm64 build fails
+          - "docker tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: "Build release image - aarch64"
+        key: build-release-image-arm64
+        depends_on: ~
+        agents:
+          queue: arm64_cpu_queue_release
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - |
+            DOCKER_BUILDKIT=1 docker build \
+              --build-arg max_jobs=16 \
+              --tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) \
+              --progress plain \
+              -f docker/Dockerfile.cuda .
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)"
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  - label: "Create multi-arch manifest"
+    key: create-multi-arch-manifest
+    depends_on:
+      - build-release-image-x86
+      - build-release-image-arm64
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker manifest create public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-x86_64 public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-aarch64 --amend"
+      - "docker manifest push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
+
+  - label: "Publish nightly multi-arch image to DockerHub"
+    depends_on:
+      - create-multi-arch-manifest
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/scripts/push-nightly-builds.sh"
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"
