@@ -14,24 +14,15 @@ if [[ -z "$RELEASE_VERSION" ]]; then
 fi
 echo "Release version: $RELEASE_VERSION"
 
-if [[ -z "$PYPI_TOKEN" ]]; then
-  echo "[FATAL] PYPI_TOKEN is not set."
-  exit 1
-else
-  export TWINE_USERNAME="__token__"
-  export TWINE_PASSWORD="$PYPI_TOKEN"
-fi
+# if [[ -z "$PYPI_TOKEN" ]]; then
+#   echo "[FATAL] PYPI_TOKEN is not set."
+#   exit 1
+# else
+#   export TWINE_USERNAME="__token__"
+#   export TWINE_PASSWORD="$PYPI_TOKEN"
+# fi
 
 set -x
-
-if ! command -v uv &> /dev/null; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
-uv venv --python 3.12 /tmp/vllm-omni-release-env
-source /tmp/vllm-omni-release-env/bin/activate
-uv pip install twine
 
 DIST_DIR=/tmp/vllm-omni-release-dist
 mkdir -p "$DIST_DIR"
@@ -47,6 +38,9 @@ if [[ -z "$PYPI_WHEEL_FILES" ]]; then
   exit 1
 fi
 
-python3 -m twine check $PYPI_WHEEL_FILES
-python3 -m twine upload --non-interactive --verbose $PYPI_WHEEL_FILES
-echo "Wheels uploaded to PyPI"
+echo "Wheels that would be uploaded to PyPI:"
+echo "$PYPI_WHEEL_FILES"
+
+# python3 -m twine check $PYPI_WHEEL_FILES
+# python3 -m twine upload --non-interactive --verbose $PYPI_WHEEL_FILES
+# echo "Wheels uploaded to PyPI"
