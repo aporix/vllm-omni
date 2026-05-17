@@ -24,11 +24,20 @@ echo "Release version: $RELEASE_VERSION"
 
 set -x
 
+ALL_DIR=/tmp/vllm-omni-release-all
 DIST_DIR=/tmp/vllm-omni-release-dist
-mkdir -p "$DIST_DIR"
+mkdir -p "$ALL_DIR" "$DIST_DIR"
 
-echo "Downloading wheels from S3:"
-aws s3 ls "$S3_COMMIT_PREFIX"
+echo "========================================"
+echo "All wheels in S3 (no filters):"
+echo "========================================"
+aws s3 cp --recursive "$S3_COMMIT_PREFIX" "$ALL_DIR"
+ls -la "$ALL_DIR"
+
+echo ""
+echo "========================================"
+echo "Filtered wheels (include: vllm_omni-${RELEASE_VERSION}*.whl, exclude: *dev*):"
+echo "========================================"
 aws s3 cp --recursive --exclude "*" --include "vllm_omni-${RELEASE_VERSION}*.whl" --exclude "*dev*" "$S3_COMMIT_PREFIX" "$DIST_DIR"
 ls -la "$DIST_DIR"
 
@@ -38,7 +47,10 @@ if [[ -z "$PYPI_WHEEL_FILES" ]]; then
   exit 1
 fi
 
+echo ""
+echo "========================================"
 echo "Wheels that would be uploaded to PyPI:"
+echo "========================================"
 echo "$PYPI_WHEEL_FILES"
 
 # python3 -m twine check $PYPI_WHEEL_FILES
