@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--num-frames", type=int, default=25, help="Number of RGB frames for text2video (max 121).")
     p.add_argument("--video-height", type=int, default=480, help="Video frame height.")
     p.add_argument("--video-width", type=int, default=768, help="Video frame width.")
+    p.add_argument("--height", type=int, default=None, help="Image height (t2i). Default = max_hw (1024).")
+    p.add_argument("--width", type=int, default=None, help="Image width (t2i). Default = max_hw (1024).")
     p.add_argument("--fps", type=int, default=8, help="Output video FPS when saving MP4.")
     p.add_argument("--output", type=str, default=".", help="Output directory.")
     p.add_argument("--steps", type=int, default=30, help="Denoising steps (Lance default 30).")
@@ -207,6 +209,10 @@ def main():
     diffusion_params.num_inference_steps = args.steps  # type: ignore
     if args.seed is not None:
         diffusion_params.seed = args.seed  # type: ignore
+    if args.height is not None:
+        diffusion_params.height = args.height  # type: ignore
+    if args.width is not None:
+        diffusion_params.width = args.width  # type: ignore
     extra = getattr(diffusion_params, "extra_args", {}) or {}
     extra["cfg_text_scale"] = args.cfg_text_scale
     extra["timestep_shift"] = args.timestep_shift

@@ -75,6 +75,40 @@ __all__ = [
 LANCE_TOKENS_PER_SECOND = 2
 LANCE_SECONDS_PER_GRID = 1.0
 
+# Upstream Lance ViT preprocessing (see lance-upstream
+# ``data/datasets_custom/validation_dataset.py`` + ``data/video/transforms/``):
+# ``VideoTransform(resolution=resolution_vit, mode='bucket',
+# divisible_crop_size=28, stride_spatial=16, aspect_ratios=[...])``.
+# For ``image_768res`` (Lance's default for 768px image gen), resolution_vit=672.
+# Resizes to the nearest aspect-ratio bucket (max_area=672², stride=16), then
+# center-crops to dims divisible by 28 (=patch_size * spatial_merge_size).
+# Standard Qwen2VLImageProcessor's smart-resize is NOT used by upstream — the
+# image enters the ViT at the bucket-cropped dimensions.
+LANCE_VIT_BUCKET_RESOLUTION = 672
+LANCE_VIT_BUCKET_STRIDE = 16
+LANCE_VIT_DIVISIBLE_CROP = 28  # patch_size (14) * spatial_merge_size (2)
+LANCE_VIT_ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+
+# Video-specific bucket parameters (resolution=video_480p — Lance's default for
+# t2v / video_edit at 12 fps).  See lance-upstream
+# ``data/datasets_custom/validation_dataset.py`` lines 128-156:
+#   VAE side: resolution_vae=640, divisible_crop_size=16, mean=0.5, std=0.5
+#   ViT side: resolution_vit=616, divisible_crop_size=28,
+#             mean=Qwen2.5-VL CLIP-norm, std=Qwen2.5-VL CLIP-norm
+LANCE_VIDEO_VAE_RESOLUTION = 640
+LANCE_VIDEO_VAE_DIVISIBLE_CROP = 16
+LANCE_VIDEO_VIT_RESOLUTION = 616
+LANCE_VIDEO_VIT_DIVISIBLE_CROP = 28
+LANCE_VIDEO_BUCKET_STRIDE = 16
+LANCE_VIDEO_TEMPORAL_STRIDE = 4  # Wan2.2 VAE temporal downsample
+LANCE_VIDEO_SAMPLE_FPS = 12  # upstream MultiClipsFrameSampler default
+LANCE_VIDEO_MAX_DURATION = 6.0  # upstream max_duration (seconds)
+LANCE_VIT_PATCH_SIZE = 14  # Qwen2.5-VL ViT spatial patch
+LANCE_VIT_TEMPORAL_PATCH_SIZE = 2  # Qwen2.5-VL ViT temporal patch
+LANCE_VIT_SPATIAL_MERGE = 2  # Qwen2.5-VL spatial merge factor
+LANCE_VIT_NORM_MEAN = (0.48145466, 0.4578275, 0.40821073)
+LANCE_VIT_NORM_STD = (0.26862954, 0.26130258, 0.27577711)
+
 
 def get_3d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
     """3-D sin-cos positional embedding (t, h, w), matching the upstream Lance
@@ -245,9 +279,355 @@ class LanceBagel(Bagel):
     """
 
     @staticmethod
+    def _lance_compute_vit_buckets():
+        """Replicate upstream Lance's ``BucketResize.init_buckets`` for the ViT path.
+
+        Returns a list of ``((bucket_h, bucket_w), bucket_ratio)`` pairs in the
+        same order as :data:`LANCE_VIT_ASPECT_RATIOS`.  Stays in sync with
+        upstream lance ``data/video/transforms/bucket_resize.py``.
+        """
+        import math
+
+        max_area = LANCE_VIT_BUCKET_RESOLUTION * LANCE_VIT_BUCKET_RESOLUTION
+        stride = LANCE_VIT_BUCKET_STRIDE
+        buckets: list[tuple[tuple[int, int], float]] = []
+        for name in LANCE_VIT_ASPECT_RATIOS:
+            w_s, h_s = (int(v) for v in name.split(":"))
+            aspect = w_s / h_s
+            # Option 1: solve for width first.
+            rw1 = math.sqrt(max_area * aspect)
+            bw1 = round(rw1 / stride) * stride
+            bh1 = round(bw1 / aspect / stride) * stride
+            br1 = bw1 / bh1
+            # Option 2: solve for height first.
+            rh2 = math.sqrt(max_area / aspect)
+            bh2 = round(rh2 / stride) * stride
+            bw2 = round(bh2 * aspect / stride) * stride
+            br2 = bw2 / bh2
+            if abs(br1 - aspect) < abs(br2 - aspect):
+                bh, bw = bh1, bw1
+            elif abs(br1 - aspect) > abs(br2 - aspect):
+                bh, bw = bh2, bw2
+            else:
+                area1 = bh1 * bw1
+                area2 = bh2 * bw2
+                if abs(area1 - max_area) <= abs(area2 - max_area):
+                    bh, bw = bh1, bw1
+                else:
+                    bh, bw = bh2, bw2
+            buckets.append(((bh, bw), bw / bh))
+        return buckets
+
+    @staticmethod
+    def _lance_bucket_resize_pil(image):
+        """Apply upstream Lance's ViT preprocessing to a PIL image.
+
+        Pipeline (matches lance-upstream's ``VideoTransform`` for the ViT path):
+
+        1. ``BucketResize``: pick the aspect-ratio bucket nearest to the input
+           and resize via ``RandomResizedCrop(scale=(1,1), ratio=fixed)``,
+           which for fixed ratio is a deterministic center-crop + resize.
+        2. ``DivisibleCrop(28)``: center-crop to dims divisible by
+           ``patch_size * spatial_merge_size`` so the resulting ViT grid is
+           clean.
+
+        Returns the post-pipeline PIL image (still RGB, just resized).  Doing
+        this BEFORE the Qwen2VLImageProcessor means smart-resize is a no-op
+        and the ViT sees exactly upstream Lance's input.
+        """
+        import numpy as _np
+        from torchvision.transforms import InterpolationMode, RandomResizedCrop
+
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        w, h = image.size
+        img_ratio = w / h
+
+        buckets = LanceBagel._lance_compute_vit_buckets()
+        # nearest bucket by absolute ratio difference
+        diffs = _np.array([abs(img_ratio - br) for _, br in buckets])
+        bh, bw = buckets[int(diffs.argmin())][0]
+        bratio = bw / bh
+
+        # RandomResizedCrop(scale=(1,1), ratio=(bratio, bratio)) is deterministic:
+        # picks the largest sub-image of the target aspect, then resizes to
+        # (bh, bw).  We replicate this directly to avoid the torchvision
+        # transform's random-state dependency and to keep the result a PIL.
+        # IMPORTANT: upstream Lance wires BucketResize through ``NaResize``
+        # which defaults to BICUBIC interpolation (NOT LANCZOS — BucketResize's
+        # own default is LANCZOS but ``NaResize`` overrides it).  Using
+        # LANCZOS here gave byte-different ViT input pixels (max_diff~0.13)
+        # which fed into the noise-query attention as wrong K/V — symptom:
+        # vllm-omni preserved the input image's hat when upstream removed it.
+        rrc = RandomResizedCrop(
+            size=(bh, bw),
+            scale=(1.0, 1.0),
+            ratio=(bratio, bratio),
+            interpolation=InterpolationMode.BICUBIC,
+        )
+        out = rrc(image)
+        # DivisibleCrop(28): center-crop to dims divisible by 28.
+        ow, oh = out.size
+        cropped_w = ow - (ow % LANCE_VIT_DIVISIBLE_CROP)
+        cropped_h = oh - (oh % LANCE_VIT_DIVISIBLE_CROP)
+        if cropped_w != ow or cropped_h != oh:
+            left = (ow - cropped_w) // 2
+            top = (oh - cropped_h) // 2
+            out = out.crop((left, top, left + cropped_w, top + cropped_h))
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Video preprocessing — frame sampler + bucket resize for VAE / ViT
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _lance_compute_video_buckets(resolution: int, stride: int):
+        """Generic version of :meth:`_lance_compute_vit_buckets` for arbitrary
+        ``resolution`` / ``stride`` (the video VAE uses 640/16, the video ViT
+        uses 616/16, both with the same 6 aspect-ratio table)."""
+        import math
+
+        max_area = resolution * resolution
+        buckets: list[tuple[tuple[int, int], float]] = []
+        for name in LANCE_VIT_ASPECT_RATIOS:
+            w_s, h_s = (int(v) for v in name.split(":"))
+            aspect = w_s / h_s
+            rw1 = math.sqrt(max_area * aspect)
+            bw1 = round(rw1 / stride) * stride
+            bh1 = round(bw1 / aspect / stride) * stride
+            br1 = bw1 / bh1
+            rh2 = math.sqrt(max_area / aspect)
+            bh2 = round(rh2 / stride) * stride
+            bw2 = round(bh2 * aspect / stride) * stride
+            br2 = bw2 / bh2
+            if abs(br1 - aspect) < abs(br2 - aspect):
+                bh, bw = bh1, bw1
+            elif abs(br1 - aspect) > abs(br2 - aspect):
+                bh, bw = bh2, bw2
+            else:
+                area1 = bh1 * bw1
+                area2 = bh2 * bw2
+                bh, bw = (bh1, bw1) if abs(area1 - max_area) <= abs(area2 - max_area) else (bh2, bw2)
+            buckets.append(((bh, bw), bw / bh))
+        return buckets
+
+    @staticmethod
+    def _lance_sample_frame_indices(num_input_frames: int, origin_fps: float) -> list[int]:
+        """Replicate upstream's ``MultiClipsFrameSampler`` (single-clip path).
+
+        Upstream config (validation_dataset.py:110):
+            temporal=4, sample_fps=12, truncate=False, max_duration=6.0,
+            length_type="kn+1", assert_seconds=False.
+
+        For a single clip covering the full input video this reduces to:
+
+            duration = min(num_input_frames / origin_fps, max_duration)
+            n_frames = round(duration * sample_fps)
+            # round to k*temporal + 1 (or -temporal+1 if already a multiple)
+            if n_frames % temporal != 0:
+                n_frames = (n_frames // temporal) * temporal + 1
+            else:
+                n_frames = (n_frames // temporal) * temporal + 1 - temporal
+            indices = np.linspace(0, num_input_frames - 1, n_frames, dtype=int)
+
+        Verified against upstream for car (93 frames @ 24fps → 45 sampled) and
+        woman (121 frames @ 24fps → 57 sampled).
+        """
+        import numpy as _np
+
+        duration = num_input_frames / origin_fps
+        duration = min(duration, LANCE_VIDEO_MAX_DURATION)
+        n_frames = int(round(duration * LANCE_VIDEO_SAMPLE_FPS))
+        t = LANCE_VIDEO_TEMPORAL_STRIDE
+        if n_frames % t != 0:
+            n_frames = (n_frames // t) * t + 1
+        else:
+            n_frames = (n_frames // t) * t + 1 - t
+        n_frames = max(n_frames, 1)
+        return _np.linspace(0, num_input_frames - 1, n_frames, dtype=int).tolist()
+
+    @staticmethod
+    def _lance_bucket_resize_video(frames_thwc, resolution: int, stride: int, divisible_crop: int, mean, std):
+        """Apply upstream Lance's VideoTransform pipeline to a (T,H,W,C) uint8
+        ndarray.  Returns ``(C, T, H', W')`` float tensor.
+
+        Pipeline (mirrors lance-upstream's ``data/transforms.py::VideoTransform``):
+
+            1. BucketResize per PIL frame: RandomResizedCrop(scale=(1,1),
+               ratio=fixed-bucket-ratio, BICUBIC) → resized PIL → to_tensor.
+               Per-frame PIL path matches upstream's
+               ``BucketResize.__call__(list[PIL.Image])`` exactly — using a
+               batched tensor RRC instead drifted pixel values by ~0.13
+               (in [0,1] range) because torchvision's tensor-BICUBIC kernel
+               differs subtly from PIL's BICUBIC kernel.
+            2. DivisibleCrop(divisible_crop) — center-crop to dims divisible
+               by patch_size * spatial_merge_size (28) for ViT, or by VAE
+               downsample (16) for VAE.
+            3. Normalize(mean, std) — VAE uses 0.5/0.5; ViT uses Qwen CLIP.
+            4. Rearrange "t c h w -> c t h w"
+        """
+        import numpy as _np
+        from PIL import Image as _Image
+        from torchvision.transforms import InterpolationMode, RandomResizedCrop
+        from torchvision.transforms.functional import center_crop as _ccrop
+        from torchvision.transforms.functional import to_tensor as _to_tensor
+
+        if not isinstance(frames_thwc, _np.ndarray):
+            raise ValueError(f"Expected (T,H,W,C) uint8 ndarray; got {type(frames_thwc)}")
+        if frames_thwc.dtype != _np.uint8:
+            frames_thwc = frames_thwc.astype(_np.uint8)
+        if frames_thwc.ndim != 4 or frames_thwc.shape[-1] != 3:
+            raise ValueError(f"Expected (T,H,W,3) uint8; got {frames_thwc.shape}")
+
+        T_in, H_in, W_in, _ = frames_thwc.shape
+        aspect = W_in / H_in
+        buckets = LanceBagel._lance_compute_video_buckets(resolution, stride)
+        diffs = _np.array([abs(aspect - br) for _, br in buckets])
+        bh, bw = buckets[int(diffs.argmin())][0]
+        bratio = bw / bh
+
+        rrc = RandomResizedCrop(
+            size=(bh, bw),
+            scale=(1.0, 1.0),
+            ratio=(bratio, bratio),
+            interpolation=InterpolationMode.BICUBIC,
+        )
+        # Per-frame PIL → RRC → to_tensor → stack — matches upstream's
+        # ``BucketResize.__call__`` for ``list[PIL.Image]`` exactly.
+        per_frame = []
+        for t in range(T_in):
+            img = _Image.fromarray(frames_thwc[t])
+            img = rrc(img)
+            per_frame.append(_to_tensor(img))  # (C, bh, bw) float [0,1]
+        frames = torch.stack(per_frame, dim=0)  # (T, C, bh, bw)
+
+        # DivisibleCrop(divisible_crop) — center-crop along H/W.
+        _, C, Hb, Wb = frames.shape
+        Hc = Hb - (Hb % divisible_crop)
+        Wc = Wb - (Wb % divisible_crop)
+        if Hc != Hb or Wc != Wb:
+            frames = _ccrop(frames, [Hc, Wc])
+
+        # Normalize.  Accept scalar or per-channel mean/std.
+        if isinstance(mean, (int, float)):
+            mean_t = torch.tensor([float(mean)] * C, dtype=frames.dtype).view(1, C, 1, 1)
+        else:
+            mean_t = torch.tensor(list(mean), dtype=frames.dtype).view(1, C, 1, 1)
+        if isinstance(std, (int, float)):
+            std_t = torch.tensor([float(std)] * C, dtype=frames.dtype).view(1, C, 1, 1)
+        else:
+            std_t = torch.tensor(list(std), dtype=frames.dtype).view(1, C, 1, 1)
+        frames = (frames - mean_t) / std_t
+
+        # Rearrange "t c h w -> c t h w"
+        frames = frames.permute(1, 0, 2, 3).contiguous()
+        return frames
+
+    @staticmethod
+    def _lance_patchify_vit_video(video_cthw: torch.Tensor):
+        """Replicate upstream ``patchify_video_with_merge``: (C, T, H, W) →
+        (num_patches, patch_dim).  ``patch_dim = C * tp * p² = 3 * 2 * 14² = 1176``.
+
+        Returns ``(packed_pixels, grid_thw)`` where ``grid_thw`` is the pre-merge
+        grid ``(T // tp, H // p, W // p)`` — same layout the Qwen2.5-VL ViT
+        expects (matches ``Qwen2VLImageProcessor.video_processor`` output up to
+        the actual pixel preprocessing).
+        """
+        p = LANCE_VIT_PATCH_SIZE
+        tp = LANCE_VIT_TEMPORAL_PATCH_SIZE
+        ms = LANCE_VIT_SPATIAL_MERGE
+        # (C, T, H, W) -> (T, C, H, W)
+        video = video_cthw.permute(1, 0, 2, 3).contiguous()
+        T, C, H, W = video.shape
+        if T % tp != 0:
+            raise ValueError(f"ViT T={T} must be divisible by temporal_patch={tp}")
+        if H % p != 0 or W % p != 0:
+            raise ValueError(f"ViT H,W=({H},{W}) must be divisible by patch={p}")
+        gt, gh, gw = T // tp, H // p, W // p
+        if gh % ms != 0 or gw % ms != 0:
+            raise ValueError(f"ViT grid ({gh},{gw}) must be divisible by merge={ms}")
+        video = video.reshape(gt, tp, C, gh // ms, ms, p, gw // ms, ms, p)
+        # permute order matches upstream: (0,3,6,4,7,2,1,5,8)
+        video = video.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        patches = video.reshape(gt * gh * gw, C * tp * p * p)
+        grid_thw = torch.tensor([[gt, gh, gw]], dtype=torch.long)
+        return patches, grid_thw
+
+    @classmethod
+    def _lance_video_preprocess(cls, frames_thwc, origin_fps: float):
+        """Full upstream-compatible video preprocessing for video_edit.
+
+        Pipeline (mirrors lance-upstream ``validation_dataset.py`` for
+        ``--resolution video_480p``):
+
+            1. Frame-sample at 12 fps with max_duration=6s (k*temporal+1 rule).
+            2. Bucket-resize the sampled frames TWICE:
+               - VAE branch (resolution=640, divisible=16, norm=0.5)
+               - ViT branch (resolution=616, divisible=28, norm=Qwen CLIP)
+            3. ViT branch is patchified to (num_patches, 1176) for direct
+               consumption by Qwen2.5-VL.
+
+        Returns:
+            vae_video   — (C, T_lat_in, H_vae, W_vae) float tensor in
+                          model-friendly [-1, 1] (mean=0.5, std=0.5).
+            vit_pixels  — (num_patches, 1176) float tensor.
+            vit_grid_thw — (1, 3) long tensor with pre-merge grid (gt, gh, gw).
+            sampled_T   — number of RGB frames after the temporal sampler.
+        """
+        import numpy as _np
+
+        if isinstance(frames_thwc, torch.Tensor):
+            frames_thwc = frames_thwc.detach().cpu().numpy()
+        if frames_thwc.dtype != _np.uint8:
+            # Allow [-1,1] / [0,1] float arrays; convert back to uint8 so the
+            # bucket transforms operate on the same domain as upstream.
+            arr = frames_thwc
+            if arr.max() <= 1.5:
+                arr = (arr * 255.0).clip(0, 255).astype(_np.uint8)
+            else:
+                arr = arr.astype(_np.uint8)
+            frames_thwc = arr
+
+        T_in = frames_thwc.shape[0]
+        indices = cls._lance_sample_frame_indices(T_in, origin_fps)
+        sampled = frames_thwc[indices]  # (T_sampled, H, W, 3)
+
+        vae_video = cls._lance_bucket_resize_video(
+            sampled,
+            resolution=LANCE_VIDEO_VAE_RESOLUTION,
+            stride=LANCE_VIDEO_BUCKET_STRIDE,
+            divisible_crop=LANCE_VIDEO_VAE_DIVISIBLE_CROP,
+            mean=0.5,
+            std=0.5,
+        )
+        vit_video = cls._lance_bucket_resize_video(
+            sampled,
+            resolution=LANCE_VIDEO_VIT_RESOLUTION,
+            stride=LANCE_VIDEO_BUCKET_STRIDE,
+            divisible_crop=LANCE_VIDEO_VIT_DIVISIBLE_CROP,
+            mean=LANCE_VIT_NORM_MEAN,
+            std=LANCE_VIT_NORM_STD,
+        )
+        # Qwen2.5-VL ViT's temporal patch size is 2 → T must be even.
+        # Upstream pads by repeating the last frame for odd T (see
+        # ``validation_dataset.py:266``):
+        #     ``video_tensor = torch.cat([video_tensor, last_frame], dim=1)``
+        if vit_video.shape[1] % 2 == 1:
+            vit_video = torch.cat([vit_video, vit_video[:, -1:]], dim=1)
+        vit_pixels, vit_grid_thw = cls._lance_patchify_vit_video(vit_video)
+        return vae_video, vit_pixels, vit_grid_thw, len(indices)
+
+    @staticmethod
     def _qwen_vl_processor_call(processor, image):
-        """Invoke the Qwen2-VL image processor and return ``(pixel_values, grid_thw)``."""
-        proc_out = processor(images=image, return_tensors="pt")
+        """Invoke the Qwen2-VL image processor and return ``(pixel_values, grid_thw)``.
+
+        Applies upstream Lance's BucketResize+DivisibleCrop BEFORE calling the
+        standard Qwen2VLImageProcessor.  After the pre-resize the input dims
+        are already divisible by ``patch_size * spatial_merge_size`` and within
+        the processor's pixel bounds, so the processor's own smart-resize is a
+        no-op — the ViT sees the exact bucket-cropped pixels upstream uses.
+        """
+        prepped = LanceBagel._lance_bucket_resize_pil(image)
+        proc_out = processor(images=prepped, return_tensors="pt")
         pixel_values = proc_out["pixel_values"]
         grid_thw = proc_out["image_grid_thw"]
         return pixel_values, grid_thw
@@ -277,16 +657,127 @@ class LanceBagel(Bagel):
             gen_input["packed_text_position_ids"] = self._mrope_broadcast(gen_input["packed_text_position_ids"])
         return gen_input, newlens, new_rope
 
-    def prepare_vae_latent(self, *args, **kwargs):
-        gen_input = super().prepare_vae_latent(*args, **kwargs)
-        if "packed_position_ids" in gen_input:
-            gen_input["packed_position_ids"] = self._mrope_broadcast(gen_input["packed_position_ids"])
+    def _per_token_mrope_for_vae_latent(self, image_sizes, curr_rope) -> torch.Tensor:
+        """Build per-token Qwen2.5-VL mRoPE positions for the gen latent block.
+
+        Matches upstream Lance (``Lance.validation_gen_KVcache`` →
+        ``get_rope_index``):
+
+            start_of_image  ->  (P-1,   P-1,   P-1)
+            latent (hi, wi) ->  (P,     P+hi,  P+wi)
+            end_of_image    ->  (P+max(h,w), ..., ...)
+
+        where ``P = curr_position_id`` is the position counter AFTER the text
+        prefix (BAGEL parent already passes ``gen_context['ropes']``). The
+        ``-1`` on start_of_image matches upstream's get_rope_index layout: the
+        start marker sits one position before the latent block (which is
+        anchored at P), and the end marker sits ``max(h,w)`` positions past.
+
+        Without per-token (h, w) variation, attention can't see the spatial
+        layout → image PSNR collapses ~6 dB after 30 steps.
+        """
+        pos_t: list[int] = []
+        pos_h: list[int] = []
+        pos_w: list[int] = []
+        for (H, W), P in zip(image_sizes, curr_rope):
+            h = H // self.latent_downsample
+            w = W // self.latent_downsample
+            # Upstream Lance (``shift_position_ids`` + ``get_rope_index``)
+            # layout for the gen latent block:
+            #   start_of_image  -> (P,         P,         P)
+            #   latent (hi, wi) -> (P+1,       P+1+hi,    P+1+wi)
+            #   end_of_image    -> (P+max+1,   P+max+1,   P+max+1)
+            # where ``P = curr_position_id`` is the rope counter AFTER the
+            # text+ViT prefix (i.e., :attr:`gen_context['ropes']` snapshot
+            # taken before the VAE-ref prefill in ``_forward_image_edit``).
+            # This matches :meth:`_lance_native_prepare_vae_images` so the
+            # gen latent occupies the SAME rope range as the VAE-ref block
+            # (modality==1 / modality==2 share rope per upstream's
+            # ``i_sample_modality==2`` branch in ``shift_position_ids``).
+            max_hw = max(h, w)
+            pos_t.append(P)
+            pos_h.append(P)
+            pos_w.append(P)
+            for hi in range(h):
+                for wi in range(w):
+                    pos_t.append(P + 1)
+                    pos_h.append(P + 1 + hi)
+                    pos_w.append(P + 1 + wi)
+            end_p = P + max_hw + 1
+            pos_t.append(end_p)
+            pos_h.append(end_p)
+            pos_w.append(end_p)
+        return torch.stack(
+            [
+                torch.tensor(pos_t, dtype=torch.long),
+                torch.tensor(pos_h, dtype=torch.long),
+                torch.tensor(pos_w, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
+    def _per_token_mrope_for_video_latent(self, video_shapes, curr_rope) -> torch.Tensor:
+        """3-D analogue of :meth:`_per_token_mrope_for_vae_latent` for video.
+
+        Matches upstream Lance's ``get_rope_index`` for ``modality==noise``
+        (and ``modality==ref_source`` since they share rope per
+        ``shift_position_ids``).  The temporal axis is amplified by
+        ``LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID`` so neighbouring
+        latent frames are well-separated, matching the upstream Qwen2.5-VL
+        rope convention.  Verified against upstream's rope dump for
+        video_edit at video_480p (call09 cond noise iter 0):
+
+            start_of_image  -> (P,           P,         P)
+            latent (t,h,w)  -> (P+1+t*2,     P+1+h,     P+1+w)
+            end_of_image    -> (P+max+1,     P+max+1,   P+max+1)
+
+        where ``max = max(t_lat*2-1, h_lat-1, w_lat-1) + 1`` matches the
+        end marker placement upstream uses (call09 final token at 159 for
+        T_lat=12, H_lat=35, W_lat=47 → max(22, 34, 46)+1=47, start=111,
+        end=158... actual upstream end=159, suggesting +2 from the body's
+        max).  We mirror :meth:`_lance_native_prepare_vae_images` exactly
+        so the VAE_ref prefill and the gen noise share the same rope range.
+        """
+        downsample_t = int(getattr(self.config.vae_config, "downsample_temporal", 4))
+        t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID
+        pos_t: list[int] = []
+        pos_h: list[int] = []
+        pos_w: list[int] = []
+        for (T, H, W), P in zip(video_shapes, curr_rope):
+            h = H // self.latent_downsample
+            w = W // self.latent_downsample
+            t = (T - 1) // downsample_t + 1
+            max_thw = max(int((t - 1) * t_scale), h - 1, w - 1) + 1
+            pos_t.append(P)
+            pos_h.append(P)
+            pos_w.append(P)
+            for ti in range(t):
+                for hi in range(h):
+                    for wi in range(w):
+                        pos_t.append(P + 1 + int(ti * t_scale))
+                        pos_h.append(P + 1 + hi)
+                        pos_w.append(P + 1 + wi)
+            end_p = P + max_thw + 1
+            pos_t.append(end_p)
+            pos_h.append(end_p)
+            pos_w.append(end_p)
+        return torch.stack(
+            [
+                torch.tensor(pos_t, dtype=torch.long),
+                torch.tensor(pos_h, dtype=torch.long),
+                torch.tensor(pos_w, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
+    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
+        gen_input = super().prepare_vae_latent(curr_kvlens, curr_rope, image_sizes, new_token_ids)
+        gen_input["packed_position_ids"] = self._per_token_mrope_for_vae_latent(image_sizes, curr_rope)
         return gen_input
 
-    def prepare_vae_latent_cfg(self, *args, **kwargs):
-        gen_input = super().prepare_vae_latent_cfg(*args, **kwargs)
-        if "cfg_packed_position_ids" in gen_input:
-            gen_input["cfg_packed_position_ids"] = self._mrope_broadcast(gen_input["cfg_packed_position_ids"])
+    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
+        gen_input = super().prepare_vae_latent_cfg(curr_kvlens, curr_rope, image_sizes)
+        gen_input["cfg_packed_position_ids"] = self._per_token_mrope_for_vae_latent(image_sizes, curr_rope)
         return gen_input
 
     def prepare_start_tokens(self, *args, **kwargs):
@@ -301,26 +792,33 @@ class LanceBagel(Bagel):
                     gen_input[k] = self._mrope_broadcast(gen_input[k])
         return gen_input
 
-    def prepare_vit_videos(self, curr_kvlens, curr_rope, videos, new_token_ids):
-        """Multi-frame ViT prefill for the ``x2t_video`` understanding path.
+    def prepare_vit_videos(
+        self,
+        curr_kvlens,
+        curr_rope,
+        videos,
+        new_token_ids,
+        precomputed_vit=None,
+    ):
+        """Multi-frame ViT prefill for the ``x2t_video`` / ``video_edit`` paths.
 
         ``videos`` is a list of per-request video tensors / numpy arrays of
-        shape ``(T, H, W, 3)``.  We call the Qwen2-VL **video** processor
-        (stored on ``self._lance_video_processor``) which produces
-        ``pixel_values_videos`` already in packed
-        ``(num_patches_flat_3d, patch_features)`` layout plus a 3-D
-        ``video_grid_thw`` (``[T_lat, H_patches, W_patches]``).  We forward the
-        same pixel-values tensor to the Qwen2.5-VL ViT (wrapped by
-        :class:`LanceQwen2_5_VLNaViTWrapper`), set the wrapper's pending
-        grid, and place the post-merger tokens in the LLM sequence with
-        proper 3-D mRoPE positions ``(P + t, P + h, P + w)`` over the
-        ``T_lat × H_lat × W_lat`` post-merge grid.
+        shape ``(T, H, W, 3)``.  By default the Qwen2-VL video processor is
+        used to convert each video to ``(pixel_values_videos, video_grid_thw)``.
+        For ``video_edit`` precision matching, the pipeline may pre-compute the
+        upstream-style BucketResize output and pass it via ``precomputed_vit``
+        — a list of ``(pixel_values, grid_thw)`` per video, in which case the
+        processor call is skipped.
         """
         processor = getattr(self, "_lance_video_processor", None)
-        if processor is None:
+        if processor is None and precomputed_vit is None:
             raise RuntimeError(
-                "LanceBagel.prepare_vit_videos requires the pipeline to set "
-                "``bagel._lance_video_processor`` (a Qwen2-VL-compatible video processor)."
+                "LanceBagel.prepare_vit_videos requires either ``precomputed_vit`` "
+                "or ``bagel._lance_video_processor`` (a Qwen2-VL-compatible video processor)."
+            )
+        if precomputed_vit is not None and len(precomputed_vit) != len(videos):
+            raise ValueError(
+                f"precomputed_vit length ({len(precomputed_vit)}) must match number of videos ({len(videos)})"
             )
 
         packed_vit_token_indexes: list[int] = []
@@ -341,7 +839,7 @@ class LanceBagel(Bagel):
         _curr = curr = 0
         newlens: list[int] = []
         new_rope: list[int] = []
-        for video, curr_kvlen, curr_position_id in zip(videos, curr_kvlens, curr_rope):
+        for vi, (video, curr_kvlen, curr_position_id) in enumerate(zip(videos, curr_kvlens, curr_rope)):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
@@ -352,12 +850,19 @@ class LanceBagel(Bagel):
             _curr += 1
             per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
 
-            proc_out = processor(videos=video, return_tensors="pt")
-            # Qwen2-VL video processor: pixel_values_videos is the same packed
-            # (num_patches_flat, patch_features) layout as the image processor
-            # but with a temporal axis ``T_lat`` in video_grid_thw.
-            pixel_values = proc_out["pixel_values_videos"]
-            grid_thw = proc_out["video_grid_thw"]
+            if precomputed_vit is not None:
+                pixel_values, grid_thw = precomputed_vit[vi]
+                if not torch.is_tensor(grid_thw):
+                    grid_thw = torch.as_tensor(grid_thw, dtype=torch.long)
+                if grid_thw.dim() == 1:
+                    grid_thw = grid_thw.unsqueeze(0)
+            else:
+                proc_out = processor(videos=video, return_tensors="pt")
+                # Qwen2-VL video processor: pixel_values_videos is packed
+                # (num_patches_flat, patch_features) with a temporal axis
+                # ``T_lat`` in video_grid_thw.
+                pixel_values = proc_out["pixel_values_videos"]
+                grid_thw = proc_out["video_grid_thw"]
             T_lat, H, W = (int(v) for v in grid_thw[0].tolist())
             num_patches_pre_merge = T_lat * H * W
             assert num_patches_pre_merge == pixel_values.shape[0], (
@@ -375,6 +880,14 @@ class LanceBagel(Bagel):
             packed_indexes.extend(range(curr, curr + num_vit_tokens))
             curr += num_vit_tokens
             _curr += num_vit_tokens
+            # Upstream Lance ViT layout (verified against video_edit rope dump
+            # for car @ video_480p — call2 t=(1000,1046), h,w=(64,110)):
+            #   start_of_image -> (P,         P,         P)
+            #   body (t,h,w)   -> (P+1+t*ts,  P+1+h,     P+1+w)
+            #   end_of_image   -> (P+max+2,   P+max+2,   P+max+2)
+            #     where max = max(ts*(T-1), h-1, w-1)
+            # then the entire ViT block's t-channel is shifted to 1000+ via
+            # ``shift_position_ids(pos_shift=1000)`` for modality=ref_vit.
             h_merged = H // merge_size
             w_merged = W // merge_size
             t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID
@@ -383,9 +896,9 @@ class LanceBagel(Bagel):
                     for wi in range(w_merged):
                         per_axis_pos.append(
                             (
-                                curr_position_id + int(ti * t_scale),
-                                curr_position_id + hi,
-                                curr_position_id + wi,
+                                curr_position_id + 1 + int(ti * t_scale),
+                                curr_position_id + 1 + hi,
+                                curr_position_id + 1 + wi,
                             )
                         )
 
@@ -394,7 +907,8 @@ class LanceBagel(Bagel):
             packed_indexes.append(curr)
             curr += 1
             _curr += 1
-            end_p = curr_position_id + max(int((T_lat - 1) * t_scale), h_merged - 1, w_merged - 1) + 1
+            max_offset = max(int((T_lat - 1) * t_scale), h_merged - 1, w_merged - 1)
+            end_p = curr_position_id + max_offset + 2
             per_axis_pos.append((end_p, end_p, end_p))
 
             packed_seqlens.append(num_vit_tokens + 2)
@@ -404,6 +918,11 @@ class LanceBagel(Bagel):
         pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
         pos_h = torch.tensor([p[1] for p in per_axis_pos], dtype=torch.long)
         pos_w = torch.tensor([p[2] for p in per_axis_pos], dtype=torch.long)
+        # Apply upstream's ViT t-channel shift (modality=ref_vit=4 → +1000).
+        # Without this, the ViT block's K/V at the t-channel collides with the
+        # VAE_ref / noise block in mRoPE space (same low-100s range), and
+        # noise-query attention picks up cross-modal leakage.
+        pos_t = pos_t - pos_t[0] + 1000
         packed_position_ids_3d = torch.stack([pos_t, pos_h, pos_w], dim=0)
 
         generation_input = {
@@ -487,21 +1006,26 @@ class LanceBagel(Bagel):
             packed_indexes.extend(range(curr, curr + num_img_tokens))
             curr += num_img_tokens
             _curr += num_img_tokens
-            # 3-D mRoPE positions for image patches: scan in row-major over the
-            # post-merge grid (H/merge × W/merge).  Temporal axis stays at the
-            # block's scalar position (single still image).
+            # 3-D mRoPE positions for image patches.  Upstream Lance
+            # (``modeling/lance/lance.py::get_rope_index`` + ``shift_position_ids``)
+            # places ViT body tokens at ``(P+1+t, P+1+h, P+1+w)`` and the
+            # surrounding markers at ``(P, ...)`` (start) / ``(P+max+1, ...)``
+            # (end), then SHIFTS the t-channel of the entire ViT block to
+            # 1000+ (modality=ref_vit=4) so ViT keys don't conflate with VAE
+            # ref / noise keys in mRoPE space.  ``new_rope = P + max + 2``.
             h_merged = H // merge_size
             w_merged = W // merge_size
+            max_hw = max(h_merged, w_merged)
             for hi in range(h_merged):
                 for wi in range(w_merged):
-                    per_axis_pos.append((curr_position_id, curr_position_id + hi, curr_position_id + wi))
+                    per_axis_pos.append((curr_position_id + 1, curr_position_id + 1 + hi, curr_position_id + 1 + wi))
 
             packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(_curr)
             packed_indexes.append(curr)
             curr += 1
             _curr += 1
-            end_p = curr_position_id + max(h_merged - 1, w_merged - 1) + 1
+            end_p = curr_position_id + max_hw + 1
             per_axis_pos.append((end_p, end_p, end_p))
 
             packed_seqlens.append(num_img_tokens + 2)
@@ -511,6 +1035,13 @@ class LanceBagel(Bagel):
         pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
         pos_h = torch.tensor([p[1] for p in per_axis_pos], dtype=torch.long)
         pos_w = torch.tensor([p[2] for p in per_axis_pos], dtype=torch.long)
+        # Upstream Lance shifts the ViT block's t-channel into a far-away rope
+        # range (1000+) via ``shift_position_ids(pos_shift=1000)`` on
+        # modality=ref_vit (4).  This makes ViT keys/queries mRoPE-orthogonal
+        # to noise/VAE-ref tokens along the t-channel, preventing leakage in
+        # the time-frequency dimension.  We apply the same shift here so the
+        # ViT segment's K, V cache content matches upstream.
+        pos_t = pos_t - pos_t[0] + 1000
         packed_position_ids_3d = torch.stack([pos_t, pos_h, pos_w], dim=0)
 
         generation_input = {
@@ -581,6 +1112,11 @@ class LanceBagel(Bagel):
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
+            # Upstream Lance places gen-latent start_of_image at ``(P, P, P)``
+            # (NOT ``P-1`` and NOT shifted to ViT t-range), body at
+            # ``(P+1+ti*t_scale, P+1+hi, P+1+wi)``, end at ``(P+max+1, ...)``.
+            # Verified against upstream's video_edit rope dump for T_lat=12,
+            # H_lat=35, W_lat=47 (call09 / cond noise iter 0).
             per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
 
             h = H // self.latent_downsample
@@ -612,9 +1148,9 @@ class LanceBagel(Bagel):
             for ti, hi, wi in zip(tt_flat, hh_flat, ww_flat):
                 per_axis_pos.append(
                     (
-                        curr_position_id + int(ti * t_scale),
-                        curr_position_id + hi,
-                        curr_position_id + wi,
+                        curr_position_id + 1 + int(ti * t_scale),
+                        curr_position_id + 1 + hi,
+                        curr_position_id + 1 + wi,
                     )
                 )
 
@@ -623,9 +1159,13 @@ class LanceBagel(Bagel):
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
-            # end_of_image sits "past" the latent block; bump along all axes by
-            # max of the latent block size so subsequent text resumes cleanly.
-            end_p = curr_position_id + max(t - 1, h - 1, w - 1) + 1
+            # end_of_image sits "past" the latent block at ``P+max+1`` on every
+            # axis, where ``max = max(t_scale*(t-1), h-1, w-1) + 1``.  Verified
+            # against upstream's call09 final token at (159, 159, 159) for
+            # T_lat=12 (t_scale=2 → max_t=22), H_lat=35 (max_h=34), W_lat=47
+            # (max_w=46), with P=111: end_p = 111 + 46 + 1 + 1 = 159. ✓
+            max_thw = max(int((t - 1) * t_scale), h - 1, w - 1) + 1
+            end_p = curr_position_id + max_thw + 1
             per_axis_pos.append((end_p, end_p, end_p))
 
             packed_seqlens.append(num_video_tokens + 2)
@@ -654,13 +1194,19 @@ class LanceBagel(Bagel):
         """3-D analogue of :meth:`prepare_vae_latent_cfg` (CFG side).
 
         Mirrors :meth:`prepare_video_latent`'s mRoPE 3-D position layout
-        (text frame ⇒ scalar; video latent block ⇒ per-token ``(P+t, P+h, P+w)``).
+        EXACTLY, including the ``LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID``
+        temporal scaling.  Without that scaling, the cfg_text branch attends
+        with different rope coordinates than the cond branch (and than
+        upstream's ``get_rope_index``), which makes ``cfg_text_v_t`` diverge
+        from upstream and the CFG combination amplifies the error every
+        denoise step.
         """
         downsample_t = int(getattr(self.config.vae_config, "downsample_temporal", 4))
 
         packed_indexes, packed_key_value_indexes = [], []
         per_axis_pos: list[tuple[int, int, int]] = []
         query_curr = curr = 0
+        t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID
         for (T, H, W), curr_kvlen, curr_position_id in zip(video_shapes, curr_kvlens, curr_rope):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
@@ -668,6 +1214,8 @@ class LanceBagel(Bagel):
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
+            # Match :meth:`prepare_video_latent` convention exactly (see
+            # comments there for the upstream rope layout this replicates).
             per_axis_pos.append((curr_position_id, curr_position_id, curr_position_id))
 
             h = H // self.latent_downsample
@@ -679,12 +1227,19 @@ class LanceBagel(Bagel):
             query_curr += num_video_tokens
             tt, hh, ww = torch.meshgrid(torch.arange(t), torch.arange(h), torch.arange(w), indexing="ij")
             for ti, hi, wi in zip(tt.flatten().tolist(), hh.flatten().tolist(), ww.flatten().tolist()):
-                per_axis_pos.append((curr_position_id + ti, curr_position_id + hi, curr_position_id + wi))
+                per_axis_pos.append(
+                    (
+                        curr_position_id + 1 + int(ti * t_scale),
+                        curr_position_id + 1 + hi,
+                        curr_position_id + 1 + wi,
+                    )
+                )
 
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
-            end_p = curr_position_id + max(t - 1, h - 1, w - 1) + 1
+            max_thw = max(int((t - 1) * t_scale), h - 1, w - 1) + 1
+            end_p = curr_position_id + max_thw + 1
             per_axis_pos.append((end_p, end_p, end_p))
 
         pos_t = torch.tensor([p[0] for p in per_axis_pos], dtype=torch.long)
@@ -776,15 +1331,32 @@ class LanceBagel(Bagel):
             packed_indexes.extend(range(curr, curr + num_image_tokens))
             curr += num_image_tokens
             query_curr += num_image_tokens
+            # Upstream Lance places VAE-ref body at ``(P+1+t*t_scale, P+1+h, P+1+w)``
+            # with the start marker at ``(P, P, P)`` and the end marker at
+            # ``(P+max+1, ...)``; gen-latent tokens (noise) share the SAME
+            # rope range via the modality_map==1/2 trick, so this is the
+            # convention used by :meth:`_per_token_mrope_for_vae_latent` (2D)
+            # and :meth:`_per_token_mrope_for_video_latent` (3D) below.
+            # For video, ``t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID``
+            # matches upstream Qwen2.5-VL's temporal-axis scaling; for still
+            # images we leave the t-channel scalar (T=1 → ``ti=0`` anyway).
+            t_scale = LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID if is_video else 1
+            max_thw = max(int((t_lat - 1) * t_scale), h_lat - 1, w_lat - 1) + 1
             for ti, hi, wi in zip(tt.flatten().tolist(), hh.flatten().tolist(), ww.flatten().tolist()):
-                per_axis_pos.append((curr_position_id + ti, curr_position_id + hi, curr_position_id + wi))
+                per_axis_pos.append(
+                    (
+                        curr_position_id + 1 + int(ti * t_scale),
+                        curr_position_id + 1 + hi,
+                        curr_position_id + 1 + wi,
+                    )
+                )
 
             packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(query_curr)
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
-            end_p = curr_position_id + max(t_lat - 1, h_lat - 1, w_lat - 1) + 1
+            end_p = curr_position_id + max_thw + 1
             per_axis_pos.append((end_p, end_p, end_p))
 
             packed_seqlens.append(num_image_tokens + 2)
@@ -824,15 +1396,25 @@ class LanceBagel(Bagel):
         return generation_input, newlens, new_rope
 
     def prepare_vae_images(self, curr_kvlens, curr_rope, images, transforms, new_token_ids, timestep=0):
-        """No-op VAE prefill for the x2t / x2t_video path.
+        """VAE prefill router.
 
-        Lance's understanding paths route image / video context through the
-        Qwen2.5-VL ViT only.  BAGEL's pipeline runs ``prepare_vae_images``
-        unconditionally for any image input, so this default override
-        short-circuits it.  :meth:`_forward_image_edit` /
-        :meth:`_forward_video_edit` call :meth:`_lance_native_prepare_vae_images`
-        directly when they actually need Lance-style VAE prefill.
+        - When ``images`` is non-empty (image_edit / video_edit path on the
+          image side): delegate to :meth:`_lance_native_prepare_vae_images`
+          which emits Lance's 3-D mRoPE positions and a real VAE prefill,
+          letting BAGEL's parent ``image_edit`` flow handle the rest.
+        - When ``images`` is empty (t2i / x2t paths): short-circuit with the
+          no-op output, mirroring BAGEL's "no image to prefill" sentinel.
         """
+        if images:
+            return self._lance_native_prepare_vae_images(
+                curr_kvlens=curr_kvlens,
+                curr_rope=curr_rope,
+                images=images,
+                transforms=transforms,
+                new_token_ids=new_token_ids,
+                timestep=timestep,
+                is_video=False,
+            )
         generation_input = {
             "padded_images": torch.empty(0, 3, 0, 0),
             "patchified_vae_latent_shapes": [],
@@ -865,6 +1447,7 @@ class LanceBagel(Bagel):
         packed_indexes=None,
         key_values_lens=None,
         packed_key_value_indexes=None,
+        precomputed_latent=None,
     ):
         """Lance-native VAE prefill that *actually* scatters the encoded
         latents into the LLM query sequence.
@@ -888,12 +1471,28 @@ class LanceBagel(Bagel):
         if (
             packed_text_ids is None
             or packed_text_ids.numel() == 0
-            or padded_images is None
-            or padded_images.numel() == 0
+            or (precomputed_latent is None and (padded_images is None or padded_images.numel() == 0))
         ):
             return past_key_values
 
-        padded_latent = vae_model.encode(padded_images)
+        # ``vae_model.encode`` samples from the posterior via
+        # ``mu + std * randn_like(std)`` (Wan2.2 VAE's ``reparameterize`` path
+        # — both upstream and vllm-omni default to ``use_sample=True``).  Each
+        # call therefore returns a DIFFERENT latent.  Upstream's image_edit
+        # encodes the reference image ONCE and reuses the resulting latent
+        # for both the cond and cfg_text branches; calling encode separately
+        # per branch made vllm-omni's gen vs cfg VAE-ref K cache diverge by
+        # ~6% rel_l2, which cascaded into ~33% v_t divergence at iter 0 on
+        # the cond branch (cfg matched within bf16 noise because it sees the
+        # SAME ref VAE K in both implementations — only gen-vs-cfg drift
+        # matters for the qualitative edit, since the noise query attends to
+        # both branches' caches at every iter).  The pipeline now encodes
+        # the ref once and threads the encoded latent into both prefill
+        # calls via ``precomputed_latent``.
+        if precomputed_latent is not None:
+            padded_latent = precomputed_latent
+        else:
+            padded_latent = vae_model.encode(padded_images)
         p = self.latent_patch_size
         packed_latent_list = []
         for latent, shape in zip(padded_latent, patchified_vae_latent_shapes):
@@ -921,6 +1520,13 @@ class LanceBagel(Bagel):
         packed_query_sequence[packed_text_indexes] = packed_text_embed.to(packed_query_sequence.dtype)
         packed_query_sequence[packed_vae_token_indexes] = packed_latent.to(packed_query_sequence.dtype)
 
+        # Upstream Lance routes the VAE-ref block through MoE_GEN because
+        # ``packed_gen_token_indexes`` in ``Lance.validation_gen_KVcache``
+        # is set to ``current_vae_token_indexes_local`` — i.e., it includes
+        # BOTH ref VAE tokens (modality=2 ref_source) AND noise tokens
+        # (modality=1).  For the VAE-ref segment forward, the mask
+        # ``packed_gen_token_indexes ∈ [current_cond_start, current_cond_end)``
+        # filters in the VAE-ref body tokens → ``mode_ = "gen"``.
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {

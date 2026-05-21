@@ -355,7 +355,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
-            timestep_shift=3.0,
+            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
             cfg_interval=cfg_interval,

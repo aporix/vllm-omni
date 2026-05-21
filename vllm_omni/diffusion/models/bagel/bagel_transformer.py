@@ -1822,7 +1822,11 @@ class Bagel(nn.Module):
     ):
         x_t = packed_init_noises
 
-        timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
+        # Use num_timesteps + 1 sample points so we get `num_timesteps` denoise
+        # steps after dropping the terminal t=0 (which has no dt).  Upstream
+        # Lance / BAGEL both use this convention; without the +1 we silently
+        # run one fewer denoise iteration than the user asked for.
+        timesteps = torch.linspace(1, 0, num_timesteps + 1, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]

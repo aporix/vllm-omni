@@ -23,6 +23,7 @@ python examples/offline_inference/lance/end2end.py \
     --model bytedance-research/Lance \
     --prompts "a corgi astronaut on the moon, cinematic" \
     --steps 30 --cfg-text-scale 4.0 --timestep-shift 3.5 \
+    --height 1024 --width 1024 \
     --output ./out
 
 # Text-to-video (uses the Lance_3B_Video subfolder; see ``--modality``
@@ -45,6 +46,7 @@ The HF repo bundles everything (`Lance_3B/`, `Lance_3B_Video/`,
 ## Defaults
 
 Matches upstream `inference_lance.sh`: 30 denoising steps, timestep-shift 3.5,
-text CFG 4.0, seed 42, 768×768.  For the understanding paths (`img2text` /
-`video2text`), sampling is enabled by default at `--text-temperature 0.8`
-because Lance's greedy decoder emits an immediate EOS for many prompts.
+text CFG 4.0, seed 42, 1024×1024 (override with `--height` / `--width`).  For
+the understanding paths (`img2text` / `video2text`), sampling is enabled by
+default at `--text-temperature 0.8` because Lance's greedy decoder emits an
+immediate EOS for many prompts.

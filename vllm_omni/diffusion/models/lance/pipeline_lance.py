@@ -77,6 +77,41 @@ from .wan_vae import LanceWanVAE
 logger = init_logger(__name__)
 
 
+def _extract_user_instruction(rendered: str) -> str:
+    """Pull just the user instruction out of a chat-template-rendered prompt.
+
+    ``render_lance_prompt`` wraps the instruction in:
+
+        <|im_start|>system\\n{sys}<|im_end|>\\n
+        <|im_start|>user\\n{vision_block}{user_text}<|im_end|>\\n
+        <|im_start|>assistant\\n
+
+    The ``image_edit`` pipeline rebuilds the chat template segment-by-segment
+    (so the rope positions and segment boundaries match upstream Lance), and
+    therefore needs only ``user_text`` — not the wrapped string.  This helper
+    extracts it; if the input doesn't look templated it's returned as-is.
+    """
+    if "<|im_start|>user" not in rendered:
+        return rendered.strip()
+    # User block sits between the user header and the next ``<|im_end|>``.
+    after_user = rendered.split("<|im_start|>user", 1)[1]
+    after_user = after_user.lstrip("\n")
+    user_block = after_user.split("<|im_end|>", 1)[0]
+    # Strip any vision_start..vision_end blocks.
+    out = []
+    i = 0
+    while i < len(user_block):
+        if user_block.startswith("<|vision_start|>", i):
+            j = user_block.find("<|vision_end|>", i)
+            if j == -1:
+                break
+            i = j + len("<|vision_end|>")
+            continue
+        out.append(user_block[i])
+        i += 1
+    return "".join(out).strip()
+
+
 @dataclass(frozen=True)
 class LanceDefaults:
     """Lance constants that upstream keeps in ``config/config_factory.py`` /
@@ -342,7 +377,18 @@ class LancePipeline(BagelPipeline):
                 fall_back_to_pt=False,
             ),
         ]
-        if und_enabled and not is_video and os.path.isdir(os.path.join(repo_root, _VIT_DIR)):
+        # Always overlay ``Qwen2.5-VL-ViT/vit.safetensors`` when the bundle
+        # contains it.  Upstream Lance's ``inference_lance.py`` loads ViT
+        # weights from ``vit.safetensors`` unconditionally (line 455-458),
+        # using the released understanding-ViT checkpoint regardless of t2i
+        # vs t2v / image_edit vs video_edit.  Lance_3B_Video bundles its own
+        # ``vit_model.*`` inside ``model.safetensors``, but loading those
+        # produced byte-different ViT outputs from upstream (rel_l2 ≈ 9
+        # at the merger output) — the bundled video-checkpoint ViT diverges
+        # from the standalone vit.safetensors.  Mirroring upstream's load
+        # order (vit.safetensors LAST so it wins) restores byte-identical
+        # ViT outputs for both image_edit and video_edit.
+        if und_enabled and os.path.isdir(os.path.join(repo_root, _VIT_DIR)):
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=weights_model,
@@ -468,6 +514,13 @@ class LancePipeline(BagelPipeline):
             return self._forward_x2t_video(req)
         if "image" in modalities and (mm_data.get("img2img") is not None or mm_data.get("image") is not None):
             return self._forward_image_edit(req)
+        # t2i falls through to BAGEL parent.  Inject Lance defaults if the
+        # caller hasn't set them: upstream uses ``cfg_text_scale=4.0`` and
+        # ``cfg_vit_scale=1.0`` (= cfg_img_scale=1.0 in BAGEL terms).
+        sp = req.sampling_params
+        if not hasattr(sp, "extra_args") or sp.extra_args is None:
+            sp.extra_args = {}
+        sp.extra_args.setdefault("cfg_img_scale", 1.0)
         return super().forward(req)
 
     @torch.inference_mode()
@@ -511,6 +564,13 @@ class LancePipeline(BagelPipeline):
         logger.info("Lance t2v: video_shape=%s", video_shape)
 
         cfg_text_scale = float(extra_args.get("cfg_text_scale", 4.0))
+        # Upstream Lance defaults cfg_interval=[0.4, 1.0] (turn off CFG below
+        # t=0.4); without this vllm-omni keeps CFG on for late iters and the
+        # last few denoise steps diverge from upstream.  cfg_renorm_type /
+        # cfg_renorm_min default to 'global' / 0 on both sides.
+        cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
+        cfg_renorm_type = str(extra_args.get("cfg_renorm_type", "global"))
+        cfg_renorm_min = float(extra_args.get("cfg_renorm_min", 0.0))
         timestep_shift = float(extra_args.get("timestep_shift", LANCE_DEFAULTS.timestep_shift))
         num_timesteps = int(req.sampling_params.num_inference_steps or LANCE_DEFAULTS.num_timesteps)
 
@@ -613,6 +673,9 @@ class LancePipeline(BagelPipeline):
                 timestep_shift=timestep_shift,
                 cfg_text_scale=cfg_text_scale,
                 cfg_img_scale=1.0,
+                cfg_interval=cfg_interval,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
                 cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
@@ -638,11 +701,30 @@ class LancePipeline(BagelPipeline):
     def _forward_image_edit(self, req):
         """Image edit (img2img): reference image + text prompt → modified image.
 
-        Mirrors :meth:`_forward_t2v` for the text/VAE prefill structure but
-        also runs ``_lance_native_prepare_vae_images`` for the reference
-        image (so the LLM sees both the Wan2.2-encoded latents and the
-        Qwen2.5-VL ViT context) and then a Lance image-gen loop emitting
-        2-D latents for the new image.
+        Matches upstream Lance's image_edit prefill structure (see
+        ``Lance.validation_gen_KVcache`` and ``validation_dataset.py``).  The
+        sequence is laid out as 5 prefill segments + 1 noise QUERY:
+
+          seg1 (causal, modality=system_prompt):
+              ``<|im_start|>system\\n{sys}<|im_end|>\\n<|im_start|>user\\n``
+          seg2 (full,   modality=ref_vit):
+              ViT(ref) — ref image through Qwen2.5-VL ViT
+          seg3 (full_noise, modality=ref_source):
+              VAE(ref) — ref image through Wan2.2 VAE, time_embed(t=0)
+          seg4 (causal, modality=text):  the user instruction
+          seg5 (causal, modality=system_prompt):
+              ``<|im_end|>\\n<|im_start|>assistant\\n``
+          seg6 (noise QUERY): the gen latent to denoise
+
+        cfg_text_context skips ONLY seg4 (the user text instruction) — every
+        other segment, including the system header, ViT and VAE prefill, the
+        separator and the noise query, is shared between gen_context and
+        cfg_text_context.  The rope counter still advances by seg4's length
+        for cfg_text_context so that seg5's rope position matches between
+        the two branches.
+
+        cfg_img is OFF by default (``cfg_img_scale=1.0`` matches upstream's
+        ``cfg_vit_scale=1.0``).
         """
 
         import numpy as np
@@ -650,10 +732,18 @@ class LancePipeline(BagelPipeline):
         from vllm_omni.diffusion.data import DiffusionOutput
 
         from .lance_transformer import NaiveCache
+        from .prompts import SYSTEM_PROMPTS
 
         first_prompt = req.prompts[0]
         assert isinstance(first_prompt, dict), "image_edit requires dict-style prompt"
-        prompt = first_prompt.get("prompt") or ""
+        # The caller may pass either a raw user instruction (e.g. "Remove the
+        # hat from the painting.") OR an already-rendered template string
+        # (with system + chat template).  Extract just the user instruction
+        # so we can rebuild the segments cleanly.
+        user_text = first_prompt.get("user_text")
+        rendered = first_prompt.get("prompt") or ""
+        if not user_text:
+            user_text = _extract_user_instruction(rendered)
         mm_data = first_prompt.get("multi_modal_data") or {}
         image_input = mm_data.get("img2img") or mm_data.get("image")
         if image_input is None:
@@ -666,7 +756,10 @@ class LancePipeline(BagelPipeline):
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
         cfg_text_scale = float(extra_args.get("cfg_text_scale", 4.0))
-        cfg_img_scale = float(extra_args.get("cfg_img_scale", 1.5))
+        cfg_img_scale = float(extra_args.get("cfg_img_scale", 1.0))
+        cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
+        cfg_renorm_type = str(extra_args.get("cfg_renorm_type", "global"))
+        cfg_renorm_min = float(extra_args.get("cfg_renorm_min", 0.0))
         timestep_shift = float(extra_args.get("timestep_shift", LANCE_DEFAULTS.timestep_shift))
         num_timesteps = int(req.sampling_params.num_inference_steps or LANCE_DEFAULTS.num_timesteps)
 
@@ -692,7 +785,7 @@ class LancePipeline(BagelPipeline):
         image_input = [_resize_to_stride(im) for im in image_input]
         resized_w, resized_h = image_input[0].size
         image_shape = (resized_h, resized_w)
-        logger.info("Lance image_edit: ref image %dx%d", resized_w, resized_h)
+        logger.info("Lance image_edit: ref image %dx%d, user_text=%r", resized_w, resized_h, user_text)
 
         def vae_transforms(img):
             arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
@@ -706,123 +799,160 @@ class LancePipeline(BagelPipeline):
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
 
-        # Match upstream Lance's edit position-id convention: input reference
-        # VAE block and output gen latent share rope range ``[0, max_axis]``,
-        # while text / ViT prefill are shifted by ``_EDIT_SHIFT`` so they
-        # never collide.  Without this, the model sees the reference at
-        # different rope coordinates than the gen target and effectively
-        # regenerates instead of editing.
-        _EDIT_SHIFT = 10000
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-
-        # VAE prefill (Lance-native, 3-D mRoPE positions) — rope starts at 0
-        # to align with the gen latent below.
-        vae_input, newlens_vae, _ = self.bagel._lance_native_prepare_vae_images(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            images=image_input,
-            transforms=vae_transforms,
-            new_token_ids=self.new_token_ids,
-            is_video=False,
-        )
-        for k, v in vae_input.items():
-            if torch.is_tensor(v):
-                vae_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                self.vae, gen_context["past_key_values"], **vae_input
-            )
-        gen_context["kv_lens"] = newlens_vae
-        # Shift rope out of the gen-latent range for the following text / ViT
-        # prefills; we snap back to 0 when constructing the gen latent.
-        gen_context["ropes"] = [_EDIT_SHIFT]
-
-        # ViT prefill (Lance Qwen2.5-VL with packed flat patches).
-        vit_input, newlens_vit, new_rope_vit = self.bagel.prepare_vit_images(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            images=image_input,
-            transforms=vit_transforms,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in vit_input.items():
-            if torch.is_tensor(v):
-                vit_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                gen_context["past_key_values"], **vit_input
-            )
-        gen_context["kv_lens"] = newlens_vit
-        gen_context["ropes"] = new_rope_vit
-
-        # Text prefill.
-        text_input, newlens_text, new_rope_text = self.bagel.prepare_prompts(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            prompts=[prompt],
-            tokenizer=self.tokenizer,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in text_input.items():
-            if torch.is_tensor(v):
-                text_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                gen_context["past_key_values"], **text_input
-            )
-        gen_context["kv_lens"] = newlens_text
-        gen_context["ropes"] = new_rope_text
-
-        # CFG text branch (unconditional text).
         cfg_text_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-        if cfg_text_scale > 1.0:
-            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
-                curr_kvlens=cfg_text_context["kv_lens"],
-                curr_rope=cfg_text_context["ropes"],
-                prompts=[str(extra_args.get("negative_prompt") or "")],
-                tokenizer=self.tokenizer,
+
+        autocast_kwargs = dict(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
+        # ----- prefill helpers (no bos/eos wrapping — that's only for free-
+        # form prompts; the segmented template provides its own markers) -----
+        def _raw_text_prefill(ctx, text_str):
+            """Prefill `text_str` as-is — no automatic bos/eos.
+
+            ``Bagel.prepare_prompts`` wraps with ``[bos] + ids + [eos]`` which
+            is fine for a single user prompt but breaks segment-by-segment
+            templating where each segment already carries its own framing
+            tokens.  This helper tokenizes raw and feeds the LLM directly.
+            """
+            text_ids = self.tokenizer.encode(text_str, add_special_tokens=False)
+            if not text_ids:
+                return
+            curr_kvlen = ctx["kv_lens"][0]
+            curr_rope = ctx["ropes"][0]
+            seq_len = len(text_ids)
+            inp = {
+                "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
+                "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
+                "packed_text_position_ids": torch.arange(
+                    curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_text_indexes": torch.arange(
+                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
+                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
+            }
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = [curr_kvlen + seq_len]
+            ctx["ropes"] = [curr_rope + seq_len]
+
+        def _vit_prefill(ctx):
+            inp, new_kvlens, new_rope = self.bagel.prepare_vit_images(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                images=image_input,
+                transforms=vit_transforms,
                 new_token_ids=self.new_token_ids,
             )
-            for k, v in neg_input.items():
+            for k, v in inp.items():
                 if torch.is_tensor(v):
-                    neg_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_text_context["past_key_values"], **neg_input
-                )
-            cfg_text_context["kv_lens"] = neg_newlens
-            cfg_text_context["ropes"] = neg_rope
+                    inp[k] = v.to(self.device)
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
 
-        # ---- 2-D latent init (image output) ----
-        # Gen latent uses rope=[0] so its tokens share position coordinates
-        # with the reference image's VAE block above (edit alignment).
+        # Encode the reference image ONCE so both gen and cfg branches share
+        # the same posterior sample.  ``LanceWanVAE.encode`` uses
+        # ``mu + std * randn_like(std)`` (Wan2.2 VAE's reparameterize path)
+        # which yields a different latent every call; calling it separately
+        # per branch drifts gen-branch K, V cache from cfg-branch by ~6%
+        # rel_l2 even though both should see the same ref.
+        _ref_padded_latent_cache = {"v": None}
+
+        def _vae_prefill(ctx):
+            inp, new_kvlens, new_rope = self.bagel._lance_native_prepare_vae_images(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                images=image_input,
+                transforms=vae_transforms,
+                new_token_ids=self.new_token_ids,
+                is_video=False,
+            )
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    inp[k] = v.to(self.device)
+            # Compute the ref VAE latent on the first prefill call; reuse
+            # for subsequent branches.
+            if _ref_padded_latent_cache["v"] is None:
+                _ref_padded_latent_cache["v"] = self.vae.encode(inp["padded_images"].to(self.device))
+            inp["precomputed_latent"] = _ref_padded_latent_cache["v"]
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vae(self.vae, ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
+
+        # ----- prefill segments in upstream order -----
+        sys_prompt = SYSTEM_PROMPTS[("image_edit", "image")]
+        seg1_str = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n"
+        seg5_str = "<|im_end|>\n<|im_start|>assistant\n"
+
+        # seg1: system + user header  (shared)
+        _raw_text_prefill(gen_context, seg1_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg1_str)
+
+        # seg2: ViT(ref)  (shared)
+        _vit_prefill(gen_context)
+        if cfg_text_scale > 1.0:
+            _vit_prefill(cfg_text_context)
+
+        # seg3: VAE(ref) with timestep=0  (shared)
+        #
+        # IMPORTANT: upstream Lance places the gen latent (the noise QUERY)
+        # at the SAME mRoPE positions as the ref VAE — they share the same
+        # spatial grid (T_lat × H_lat × W_lat), and the model treats them
+        # as two timesteps of the same latent location.  Concretely, upstream
+        # ``get_rope_index`` emits ``[base_t, base_h+hi, base_w+wi]`` for
+        # both the VAE cond block AND the noise block, anchored at the SAME
+        # base.  This is the inductive bias that lets the model "edit" the
+        # ref image — without this overlap the model has no way to map noise
+        # tokens to ref tokens.
+        #
+        # We therefore snapshot ``ropes`` BEFORE the VAE prefill and reuse
+        # that as the gen latent's ``curr_rope`` below.
+        rope_before_vae = gen_context["ropes"][0]
+        cfg_rope_before_vae = cfg_text_context["ropes"][0] if cfg_text_scale > 1.0 else rope_before_vae
+        _vae_prefill(gen_context)
+        if cfg_text_scale > 1.0:
+            _vae_prefill(cfg_text_context)
+
+        # seg4: user instruction  (gen only).  Upstream Lance's cfg_text
+        # branch is a SHORTER sequence with the user_text segment REMOVED
+        # (see ``uncond_split_pro_kvcache`` + ``get_rope_index`` on the
+        # filtered text_ids), so cfg_text's rope counter MUST NOT advance
+        # past the user_text region.  seg5 (separator) therefore lands at
+        # different absolute rope positions in gen vs cfg branches — that's
+        # the intended behavior.
+        _raw_text_prefill(gen_context, user_text)
+
+        # seg5: separator + assistant header  (gen + cfg).  Each branch
+        # places it at its OWN current rope.
+        _raw_text_prefill(gen_context, seg5_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg5_str)
+
+        # -- (4) Gen latent at the SAME rope position as the ref VAE block.
+        # See the comment on `rope_before_vae` above.  Note the KV cache
+        # still contains all prefilled segments (system, ViT, ref VAE, user
+        # text, separator); only the gen latent's QUERY rope coordinates are
+        # rewound to overlap with the ref VAE.
         gen_input_lat = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
-            curr_rope=[0],
+            curr_rope=[rope_before_vae],
             image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
         )
@@ -831,34 +961,33 @@ class LancePipeline(BagelPipeline):
                 gen_input_lat[k] = v.to(self.device)
         cfg_text_lat = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
-            curr_rope=[0],
-            image_sizes=[image_shape],
-        )
-        cfg_img_lat = self.bagel.prepare_vae_latent_cfg(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=[0],
+            curr_rope=[cfg_rope_before_vae],
             image_sizes=[image_shape],
         )
         for k, v in cfg_text_lat.items():
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
-        for k, v in cfg_img_lat.items():
-            if torch.is_tensor(v):
-                cfg_img_lat[k] = v.to(self.device)
 
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
+        # cfg_img branch: keep off (cfg_img_scale=1.0 matches upstream
+        # ``cfg_vit_scale=1.0``).  generate_image needs the cfg_img_* args
+        # but skips the branch when scale<=1.0; just point them at the
+        # cond's lat metadata so shapes/types are fine.
+        cfg_img_lat = cfg_text_lat
+
+        with torch.autocast(**autocast_kwargs):
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
-                cfg_text_past_key_values=cfg_text_context["past_key_values"],
+                cfg_text_past_key_values=cfg_text_context["past_key_values"]
+                if cfg_text_scale > 1.0
+                else gen_context["past_key_values"],
                 cfg_img_past_key_values=gen_context["past_key_values"],
                 num_timesteps=num_timesteps,
                 timestep_shift=timestep_shift,
                 cfg_text_scale=cfg_text_scale,
                 cfg_img_scale=cfg_img_scale,
+                cfg_interval=cfg_interval,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
                 cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
@@ -881,179 +1010,275 @@ class LancePipeline(BagelPipeline):
     def _forward_video_edit(self, req):
         """Video edit: reference video + text prompt → modified video.
 
-        Lance-native VAE prefill (multi-frame Wan2.2 encoding) + Qwen2.5-VL
-        ViT prefill + 3-D latent denoising + ``LanceWanVAE.decode_video``.
-        Mirrors :meth:`_forward_image_edit` but with the temporal axis
-        threaded through both prefill and gen latent.
+        Mirrors :meth:`_forward_image_edit`'s segmented prefill layout with
+        a temporal axis threaded through both prefill and the gen latent.
+        Verified against upstream Lance's ``Lance.validation_gen_KVcache`` for
+        ``--task video_edit --resolution video_480p``:
+
+          seg1 (causal, modality=system_prompt):
+              ``<|im_start|>system\\n{sys}<|im_end|>\\n<|im_start|>user\\n``
+          seg2 (full,   modality=ref_vit):
+              ViT(video) — ref video through Qwen2.5-VL ViT, t-axis +1000
+          seg3 (full_noise, modality=ref_source):
+              VAE(video) — ref video through Wan2.2 VAE, time_embed(t=0).
+              Rope shares range with the gen noise latent (modality 1==2
+              trick) so the model can align ref↔output per ``(t,h,w)``.
+          seg4 (causal, modality=text):  the user instruction
+          seg5 (causal, modality=system_prompt):
+              ``<|im_end|>\\n<|im_start|>assistant\\n``
+          seg6 (noise QUERY): 3-D gen latent at the SAME rope as seg3.
+
+        cfg_text_context skips ONLY seg4 (user text), matching upstream's
+        ``uncond_split_pro_kvcache``.  cfg_img defaults to off
+        (``cfg_img_scale=1.0`` → upstream's ``cfg_vit_scale=1.0``).
+
+        Replaces the previous shifted-rope layout (``_EDIT_SHIFT=10000``)
+        which kept ViT/text at a far-away rope range — that caused 15.5%
+        rel_l2 divergence at layer 0 output (cond) vs upstream because the
+        noise query attended to a cached K/V at rope (0..47) while upstream
+        attends at rope (111..159).
         """
+
+        import numpy as _np
 
         from vllm_omni.diffusion.data import DiffusionOutput
 
         from .lance_transformer import NaiveCache
+        from .prompts import SYSTEM_PROMPTS
 
         first_prompt = req.prompts[0]
         assert isinstance(first_prompt, dict), "video_edit requires dict-style prompt"
-        prompt = first_prompt.get("prompt") or ""
+        user_text = first_prompt.get("user_text")
+        rendered = first_prompt.get("prompt") or ""
+        if not user_text:
+            user_text = _extract_user_instruction(rendered)
         mm_data = first_prompt.get("multi_modal_data") or {}
         video_input = mm_data.get("video")
         if video_input is None:
             raise ValueError("video_edit requires multi_modal_data.video.")
-        if isinstance(video_input, str):
-            import imageio.v3 as iio
-
-            video_input = iio.imread(video_input)
-        # ``video_input`` now: ndarray (T, H, W, 3).  Permute to (C, T, H, W) for VAE.
-        import numpy as _np
-
-        if isinstance(video_input, _np.ndarray):
-            video_chw = torch.from_numpy(video_input).float() / 127.5 - 1.0  # (T, H, W, 3)
-            video_chw = video_chw.permute(3, 0, 1, 2).contiguous()  # (C, T, H, W)
-        elif torch.is_tensor(video_input):
-            video_chw = video_input.float()
-        else:
-            raise ValueError(f"Unsupported video_input type {type(video_input)}")
-        T = int(video_chw.shape[1])
-        H = int(video_chw.shape[2])
-        W = int(video_chw.shape[3])
-
+        # Resolve to raw (T, H, W, 3) uint8 ndarray + origin_fps so the
+        # upstream-style bucket resize + frame sampler can replicate the
+        # exact preprocessing path.  If the caller passed an already-decoded
+        # ndarray with no FPS, default to 24fps (matches the official
+        # video_edit examples).
         extra_args = first_prompt.get("extra_args") or {}
         sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
         extra_args = {**extra_args, **sp_extra}
+        origin_fps_default = float(extra_args.get("origin_fps", 24.0))
+        # Path-only fast path: use decord (matches upstream Lance's
+        # ``data/datasets_custom/validation_dataset.py`` which decodes via
+        # ``decord.VideoReader``).  decord vs cv2 produce different YUV→RGB
+        # conversions (~0.1 RGB units of max diff), and that propagates into
+        # both the VAE and ViT pixel inputs.  Falling back to cv2 only when
+        # decord is unavailable keeps single-machine parity with upstream
+        # while not requiring decord in production.
+        if isinstance(video_input, str):
+            try:
+                import decord as _decord
+                from decord import VideoReader as _VideoReader  # type: ignore
+
+                vr = _VideoReader(video_input, ctx=_decord.cpu(0))
+                origin_fps = float(vr.get_avg_fps()) or origin_fps_default
+                idx_all = list(range(len(vr)))
+                video_raw = vr.get_batch(idx_all).asnumpy()  # (T, H, W, 3) uint8 RGB
+            except ImportError:
+                import cv2 as _cv2
+
+                cap = _cv2.VideoCapture(video_input)
+                origin_fps = float(cap.get(_cv2.CAP_PROP_FPS) or origin_fps_default)
+                frames_bgr = []
+                while True:
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    frames_bgr.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
+                cap.release()
+                video_raw = _np.stack(frames_bgr, axis=0)
+        elif isinstance(video_input, _np.ndarray):
+            video_raw = video_input
+            origin_fps = origin_fps_default
+        elif torch.is_tensor(video_input):
+            arr = video_input.detach().cpu().numpy()
+            if arr.max() <= 1.5:
+                arr = (arr * 255.0).clip(0, 255).astype(_np.uint8)
+            video_raw = arr
+            origin_fps = origin_fps_default
+        else:
+            raise ValueError(f"Unsupported video_input type {type(video_input)}")
+
         cfg_text_scale = float(extra_args.get("cfg_text_scale", 4.0))
-        cfg_img_scale = float(extra_args.get("cfg_img_scale", 1.5))
+        cfg_img_scale = float(extra_args.get("cfg_img_scale", 1.0))
+        # Upstream Lance default is ``cfg_interval=[0, 1]`` (CFG active on every
+        # denoise step).  vllm-omni's previous (0.4, 1.0) skipped CFG for the
+        # last ~10 iterations after timestep_shift=3.5, which contributed
+        # most of the late-trajectory drift from upstream.
+        cfg_interval = tuple(extra_args.get("cfg_interval", (0.0, 1.0)))
+        cfg_renorm_type = str(extra_args.get("cfg_renorm_type", "global"))
+        cfg_renorm_min = float(extra_args.get("cfg_renorm_min", 0.0))
         timestep_shift = float(extra_args.get("timestep_shift", LANCE_DEFAULTS.timestep_shift))
         num_timesteps = int(req.sampling_params.num_inference_steps or LANCE_DEFAULTS.num_timesteps)
-        video_shape = (T, H, W)
-        logger.info("Lance video_edit: video %dx%dx%d (T,H,W)", T, H, W)
 
-        def vae_transforms(_):
-            return video_chw
+        # Run upstream's BucketResize + frame sampler so VAE / ViT see
+        # byte-identical pixels to the reference implementation.  Without this,
+        # vllm-omni's ViT grid was (T=23, H=40, W=54) for the car video versus
+        # upstream's (T=23, H=36, W=50) — different K/V at ViT positions
+        # accounted for the residual ~9% rel_l2 at layer 0 output.
+        from .lance_transformer import LanceBagel as _LanceBagel
+
+        vae_video, vit_pixels, vit_grid_thw, sampled_T = _LanceBagel._lance_video_preprocess(video_raw, origin_fps)
+        video_chw = vae_video  # (C, T_sampled, H_vae, W_vae) — model-space [-1,1]
+        T_sampled = int(video_chw.shape[1])
+        H_vae = int(video_chw.shape[2])
+        W_vae = int(video_chw.shape[3])
+        video_shape = (T_sampled, H_vae, W_vae)
+        logger.info(
+            "Lance video_edit: input %dx%dx%d → sampled %dx%dx%d (T,H,W) @ %.2ffps, ViT grid_thw=%s, user_text=%r",
+            video_raw.shape[0],
+            video_raw.shape[1],
+            video_raw.shape[2],
+            T_sampled,
+            H_vae,
+            W_vae,
+            origin_fps,
+            tuple(vit_grid_thw[0].tolist()),
+            user_text,
+        )
 
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
 
-        # Position-id layout for video editing — matches upstream Lance's
-        # ``shift_position_ids(pos_shift=1000)`` + ``modality1=modality2``
-        # convention:
-        #   * input video VAE block + output gen video latent share the same
-        #     rope range [0, max(T_lat, H_lat, W_lat)] so the model can align
-        #     "edit *this* token" between reference and output;
-        #   * text + ViT prefill use a far-shifted rope start (``_EDIT_SHIFT``)
-        #     so their positions never collide with the VAE/gen range.
-        _EDIT_SHIFT = 10000
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-
-        # Multi-frame VAE prefill — rope starts at 0 (aligned with gen latent below).
-        vae_input, newlens_vae, _ = self.bagel._lance_native_prepare_vae_images(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            images=[video_chw],
-            transforms=vae_transforms,
-            new_token_ids=self.new_token_ids,
-            is_video=True,
-        )
-        for k, v in vae_input.items():
-            if torch.is_tensor(v):
-                vae_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                self.vae, gen_context["past_key_values"], **vae_input
-            )
-        gen_context["kv_lens"] = newlens_vae
-        # Reset rope to the post-VAE shifted range for the text / ViT prefill;
-        # we'll snap back to 0 when constructing the gen latent so it shares
-        # positions with the VAE-prefilled reference.
-        gen_context["ropes"] = [_EDIT_SHIFT]
-
-        # Multi-frame ViT prefill (reuse x2t_video prep).
-        vit_input, newlens_vit, new_rope_vit = self.bagel.prepare_vit_videos(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            videos=[video_input],
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in vit_input.items():
-            if torch.is_tensor(v):
-                vit_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                gen_context["past_key_values"], **vit_input
-            )
-        gen_context["kv_lens"] = newlens_vit
-        gen_context["ropes"] = new_rope_vit
-
-        # Text prefill.
-        text_input, newlens_text, new_rope_text = self.bagel.prepare_prompts(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            prompts=[prompt],
-            tokenizer=self.tokenizer,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in text_input.items():
-            if torch.is_tensor(v):
-                text_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                gen_context["past_key_values"], **text_input
-            )
-        gen_context["kv_lens"] = newlens_text
-        gen_context["ropes"] = new_rope_text
-
-        # CFG text branch.
         cfg_text_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-        if cfg_text_scale > 1.0:
-            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
-                curr_kvlens=cfg_text_context["kv_lens"],
-                curr_rope=cfg_text_context["ropes"],
-                prompts=[str(extra_args.get("negative_prompt") or "")],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            for k, v in neg_input.items():
-                if torch.is_tensor(v):
-                    neg_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_text_context["past_key_values"], **neg_input
-                )
-            cfg_text_context["kv_lens"] = neg_newlens
-            cfg_text_context["ropes"] = neg_rope
 
-        # 3-D latent init (video output).  ``curr_rope=[0]`` so the gen latent
-        # tokens share positions with the input VAE block above — that's what
-        # tells the model "edit token (t,h,w) in the input is token (t,h,w) in
-        # the output".  The kv-cache still contains the text/ViT blocks at the
-        # shifted rope range, so attending over them works.
+        autocast_kwargs = dict(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
+        def _raw_text_prefill(ctx, text_str):
+            """Prefill ``text_str`` as raw token ids — no bos/eos wrapping."""
+            text_ids = self.tokenizer.encode(text_str, add_special_tokens=False)
+            if not text_ids:
+                return
+            curr_kvlen = ctx["kv_lens"][0]
+            curr_rope = ctx["ropes"][0]
+            seq_len = len(text_ids)
+            inp = {
+                "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
+                "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
+                "packed_text_position_ids": torch.arange(
+                    curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_text_indexes": torch.arange(
+                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
+                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
+            }
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = [curr_kvlen + seq_len]
+            ctx["ropes"] = [curr_rope + seq_len]
+
+        def _vit_prefill(ctx):
+            # Feed the bucket-resized + patchified ViT pixels directly so the
+            # Qwen2VLImageProcessor path (smart-resize, wrong grid) is bypassed.
+            inp, new_kvlens, new_rope = self.bagel.prepare_vit_videos(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                videos=[video_raw],  # passed through for length/iter only
+                new_token_ids=self.new_token_ids,
+                precomputed_vit=[(vit_pixels, vit_grid_thw)],
+            )
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    inp[k] = v.to(self.device)
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
+
+        # Encode the reference video ONCE so both gen and cfg branches share
+        # the same posterior sample (see image_edit fix — Wan2.2 VAE's
+        # ``mu + std * randn_like(std)`` would otherwise drift between
+        # branches).
+        _ref_padded_latent_cache = {"v": None}
+
+        def _vae_transforms(_):
+            return video_chw
+
+        def _vae_prefill(ctx):
+            inp, new_kvlens, new_rope = self.bagel._lance_native_prepare_vae_images(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                images=[video_chw],
+                transforms=_vae_transforms,
+                new_token_ids=self.new_token_ids,
+                is_video=True,
+            )
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    inp[k] = v.to(self.device)
+            if _ref_padded_latent_cache["v"] is None:
+                _ref_padded_latent_cache["v"] = self.vae.encode(inp["padded_images"].to(self.device))
+            inp["precomputed_latent"] = _ref_padded_latent_cache["v"]
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vae(self.vae, ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
+
+        # ----- prefill segments in upstream order -----
+        sys_prompt = SYSTEM_PROMPTS[("video_edit", "video")]
+        seg1_str = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n"
+        seg5_str = "<|im_end|>\n<|im_start|>assistant\n"
+
+        # seg1: system + user header  (shared)
+        _raw_text_prefill(gen_context, seg1_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg1_str)
+
+        # seg2: ViT(ref)  (shared)
+        _vit_prefill(gen_context)
+        if cfg_text_scale > 1.0:
+            _vit_prefill(cfg_text_context)
+
+        # seg3: VAE(ref) — snapshot rope BEFORE the prefill so the gen noise
+        # latent can be placed at the SAME rope range (matches upstream's
+        # modality==1≡2 trick).
+        rope_before_vae = gen_context["ropes"][0]
+        cfg_rope_before_vae = cfg_text_context["ropes"][0] if cfg_text_scale > 1.0 else rope_before_vae
+        _vae_prefill(gen_context)
+        if cfg_text_scale > 1.0:
+            _vae_prefill(cfg_text_context)
+
+        # seg4: user instruction  (gen only — cfg branch skips per upstream).
+        _raw_text_prefill(gen_context, user_text)
+
+        # seg5: separator + assistant header  (both gen and cfg, each at its
+        # own current rope; cfg's lands earlier than gen's because cfg
+        # skipped seg4).
+        _raw_text_prefill(gen_context, seg5_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg5_str)
+
+        # seg6 (noise QUERY): gen latent at the SAME rope as the ref VAE
+        # block.  KV cache still contains sys+ViT+VAE_ref+user_text+sep at
+        # their post-prefill rope positions; only the noise query's Q rope
+        # is rewound to overlap with the VAE_ref block.
         gen_input_lat = self.bagel.prepare_video_latent(
             curr_kvlens=gen_context["kv_lens"],
-            curr_rope=[0],
+            curr_rope=[rope_before_vae],
             video_shapes=[video_shape],
             new_token_ids=self.new_token_ids,
         )
@@ -1062,34 +1287,31 @@ class LancePipeline(BagelPipeline):
                 gen_input_lat[k] = v.to(self.device)
         cfg_text_lat = self.bagel.prepare_video_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
-            curr_rope=[0],
-            video_shapes=[video_shape],
-        )
-        cfg_img_lat = self.bagel.prepare_video_latent_cfg(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=[0],
+            curr_rope=[cfg_rope_before_vae],
             video_shapes=[video_shape],
         )
         for k, v in cfg_text_lat.items():
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
-        for k, v in cfg_img_lat.items():
-            if torch.is_tensor(v):
-                cfg_img_lat[k] = v.to(self.device)
 
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
+        # cfg_img branch is off (cfg_img_scale=1.0); generate_image needs the
+        # arg surface but skips the branch when scale<=1.0.
+        cfg_img_lat = cfg_text_lat
+
+        with torch.autocast(**autocast_kwargs):
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
-                cfg_text_past_key_values=cfg_text_context["past_key_values"],
+                cfg_text_past_key_values=cfg_text_context["past_key_values"]
+                if cfg_text_scale > 1.0
+                else gen_context["past_key_values"],
                 cfg_img_past_key_values=gen_context["past_key_values"],
                 num_timesteps=num_timesteps,
                 timestep_shift=timestep_shift,
                 cfg_text_scale=cfg_text_scale,
                 cfg_img_scale=cfg_img_scale,
+                cfg_interval=cfg_interval,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
                 cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
