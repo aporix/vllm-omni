@@ -9,7 +9,7 @@ requests via the OpenAI-compatible chat completions API exposed by
 Equivalent to running:
 
     vllm-omni serve "bytedance-research/Lance" --omni \\
-        --deploy-config vllm_omni/deploy/lance.yaml --port 8091
+        --pipeline lance --enforce-eager --trust-remote-code --port 8091
 
     # text2img
     python3 examples/online_serving/lance/openai_chat_client.py \\
@@ -25,7 +25,6 @@ from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.diffusion.models.lance.prompts import (
     VIDEO_PAD,
     VISION_END,
@@ -36,7 +35,6 @@ from vllm_omni.diffusion.models.lance.prompts import (
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "bytedance-research/Lance"
-STAGE_CONFIGS_PATH = get_deploy_config_path("ci/lance.yaml")
 
 TEXT2IMG_PROMPT = "A cute corgi astronaut on the moon, cinematic"
 IMG2IMG_PROMPT = "Convert this into a vibrant cartoon-style illustration"
@@ -44,10 +42,26 @@ IMG2IMG_PROMPT = "Convert this into a vibrant cartoon-style illustration"
 # Lance vision block: <|vision_start|><|video_pad|><|vision_end|>
 _VISION_BLOCK = f"{VISION_START}{VIDEO_PAD}{VISION_END}"
 
+# Lance is single-stage diffusion — no deploy YAML.  Pass the engine
+# knobs that used to live in ``vllm_omni/deploy/lance.yaml`` via CLI
+# flags so ``create_default_diffusion`` builds the stage config.
+_LANCE_SERVE_ARGS = [
+    "--pipeline",
+    "lance",
+    "--max-num-batched-tokens",
+    "32768",
+    "--max-num-seqs",
+    "1",
+    "--enforce-eager",
+    "--trust-remote-code",
+    "--no-enable-prefix-caching",
+    "--no-async-chunk",
+]
+
 test_params = [
     OmniServerParams(
         model=MODEL,
-        stage_config_path=STAGE_CONFIGS_PATH,
+        server_args=_LANCE_SERVE_ARGS,
         stage_init_timeout=300,
     ),
 ]

@@ -141,7 +141,6 @@ _PARAMS_VIDEO = None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="Parent snapshot dir containing Lance_3B and Lance_3B_Video subdirs.")
-    p.add_argument("--deploy-config", default="vllm_omni/deploy/lance.yaml", help="Lance deploy YAML.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--share", action="store_true")
@@ -198,7 +197,6 @@ def _resolve_ckpts(snapshot: str):
 
 def _init_models(
     snapshot: str,
-    deploy_config: str,
     ulysses_degree: int = 1,
     replicas_per_omni: int = 1,
 ):
@@ -290,7 +288,20 @@ def _init_models(
         f"  replicas={replicas_per_omni}...",
         flush=True,
     )
-    img_kwargs: dict = {"model": img_ckpt, "deploy_config": deploy_config}
+    # Lance is single-stage diffusion — no deploy YAML.  The defaults
+    # below match the (now-removed) ``vllm_omni/deploy/lance.yaml`` so
+    # ``create_default_diffusion`` produces the same stage config.
+    lance_engine_defaults = dict(
+        pipeline="lance",
+        max_num_batched_tokens=32768,
+        max_num_seqs=1,
+        enforce_eager=True,
+        trust_remote_code=True,
+        enable_prefix_caching=False,
+        async_chunk=False,
+    )
+
+    img_kwargs: dict = {"model": img_ckpt, **lance_engine_defaults}
     if img_devices != "0":
         img_kwargs["stage_0_devices"] = img_devices
     if use_sp:
@@ -309,7 +320,7 @@ def _init_models(
         f"  replicas={replicas_per_omni}...",
         flush=True,
     )
-    vid_kwargs: dict = {"model": vid_ckpt, "deploy_config": deploy_config}
+    vid_kwargs: dict = {"model": vid_ckpt, **lance_engine_defaults}
     vid_kwargs["stage_0_devices"] = vid_devices
     if use_sp:
         vid_kwargs["ulysses_degree"] = ulysses_degree
@@ -1240,7 +1251,6 @@ def main():
     print("=" * 60, flush=True)
     _init_models(
         args.model,
-        args.deploy_config,
         ulysses_degree=args.ulysses_degree,
         replicas_per_omni=args.replicas_per_omni,
     )

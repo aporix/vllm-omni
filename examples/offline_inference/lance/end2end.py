@@ -77,12 +77,10 @@ def parse_args():
             "caption-style default and the model describes instead of answering)."
         ),
     )
-    p.add_argument(
-        "--deploy-config",
-        type=str,
-        default="vllm_omni/deploy/lance.yaml",
-        help="Deploy YAML (single-stage Lance).",
-    )
+    # Lance is single-stage diffusion — no deploy YAML needed.  Required
+    # engine knobs (``pipeline``, ``enforce_eager``, ``trust_remote_code``,
+    # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below
+    # and ``create_default_diffusion`` materializes the stage config.
 
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
@@ -235,8 +233,15 @@ def main():
                 resolved_model = candidate
 
     omni_kwargs = vars(args).copy()
-    omni_kwargs["deploy_config"] = args.deploy_config
     omni_kwargs["model"] = resolved_model
+    # Lance single-stage defaults (formerly in vllm_omni/deploy/lance.yaml):
+    omni_kwargs.setdefault("pipeline", "lance")
+    omni_kwargs.setdefault("max_num_batched_tokens", 32768)
+    omni_kwargs.setdefault("max_num_seqs", 1)
+    omni_kwargs.setdefault("enforce_eager", True)
+    omni_kwargs.setdefault("trust_remote_code", True)
+    omni_kwargs.setdefault("enable_prefix_caching", False)
+    omni_kwargs.setdefault("async_chunk", False)
     omni = Omni(**omni_kwargs)
 
     if args.modality == "img2text":

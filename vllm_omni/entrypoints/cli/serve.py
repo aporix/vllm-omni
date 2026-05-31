@@ -507,13 +507,16 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit'",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache'",
         )
         omni_config_group.add_argument(
             "--cache-config",
             type=str,
             default=None,
-            help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
+            help="JSON string of cache configuration. "
+            "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
+            'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
+            "Calibration mode: add '\"mag_calibrate\": true'",
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",
@@ -650,6 +653,16 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable AR stage profiler to include AR stage timing in stage_durations.",
         )
+
+        # Supplementary auxiliary text encoder parameters
+        # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)
+        omni_config_group.add_argument(
+            "--auxiliary-text-encoder",
+            type=str,
+            default=None,
+            help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
+        )
+
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
