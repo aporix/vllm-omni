@@ -669,6 +669,12 @@ class LancePipeline(BagelPipeline):
             enabled=self.device.type != "cpu",
             dtype=self.od_config.dtype,
         ):
+            # ``prepare_video_latent`` / ``prepare_vae_latent`` still return
+            # ``key_values_lens`` / ``packed_indexes`` / ``packed_key_value_indexes``
+            # but post-main-merge ``generate_image`` doesn't accept them — drop
+            # before unpacking via ``**gen_input_lat``.
+            for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
+                gen_input_lat.pop(_drop, None)
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
@@ -682,13 +688,11 @@ class LancePipeline(BagelPipeline):
                 cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=cfg_text_lat["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=cfg_text_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
+                # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
+                # (derived from ``cfg_text_past_key_values``).
                 cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=cfg_img_lat["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=cfg_img_lat["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=cfg_img_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
@@ -836,17 +840,17 @@ class LancePipeline(BagelPipeline):
             curr_kvlen = ctx["kv_lens"][0]
             curr_rope = ctx["ropes"][0]
             seq_len = len(text_ids)
+            # ``forward_cache_update_text`` post-main-merge derives the
+            # remaining positions from ``past_key_values`` + the query
+            # length; the old ``packed_text_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` kwargs
+            # were dropped from its signature.
             inp = {
                 "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
                 "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
                 "packed_text_position_ids": torch.arange(
                     curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
                 ),
-                "packed_text_indexes": torch.arange(
-                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
-                ),
-                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
-                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
             }
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
@@ -864,6 +868,12 @@ class LancePipeline(BagelPipeline):
             for k, v in inp.items():
                 if torch.is_tensor(v):
                     inp[k] = v.to(self.device)
+            # ``prepare_vit_images`` still returns ``packed_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` for
+            # historical reasons; ``forward_cache_update_vit`` post-main
+            # no longer accepts them — pop before unpacking.
+            for _drop in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                inp.pop(_drop, None)
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
             ctx["kv_lens"] = new_kvlens
@@ -979,6 +989,12 @@ class LancePipeline(BagelPipeline):
         cfg_img_lat = cfg_text_lat
 
         with torch.autocast(**autocast_kwargs):
+            # ``prepare_video_latent`` / ``prepare_vae_latent`` still return
+            # ``key_values_lens`` / ``packed_indexes`` / ``packed_key_value_indexes``
+            # but post-main-merge ``generate_image`` doesn't accept them — drop
+            # before unpacking via ``**gen_input_lat``.
+            for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
+                gen_input_lat.pop(_drop, None)
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
@@ -994,13 +1010,11 @@ class LancePipeline(BagelPipeline):
                 cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=cfg_text_lat["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=cfg_text_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
+                # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
+                # (derived from ``cfg_text_past_key_values``).
                 cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=cfg_img_lat["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=cfg_img_lat["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=cfg_img_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
@@ -1162,17 +1176,17 @@ class LancePipeline(BagelPipeline):
             curr_kvlen = ctx["kv_lens"][0]
             curr_rope = ctx["ropes"][0]
             seq_len = len(text_ids)
+            # ``forward_cache_update_text`` post-main-merge derives the
+            # remaining positions from ``past_key_values`` + the query
+            # length; the old ``packed_text_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` kwargs
+            # were dropped from its signature.
             inp = {
                 "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
                 "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
                 "packed_text_position_ids": torch.arange(
                     curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
                 ),
-                "packed_text_indexes": torch.arange(
-                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
-                ),
-                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
-                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
             }
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
@@ -1190,6 +1204,12 @@ class LancePipeline(BagelPipeline):
             for k, v in inp.items():
                 if torch.is_tensor(v):
                     inp[k] = v.to(self.device)
+            # ``prepare_vit_images`` still returns ``packed_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` for
+            # historical reasons; ``forward_cache_update_vit`` post-main
+            # no longer accepts them — pop before unpacking.
+            for _drop in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                inp.pop(_drop, None)
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
             ctx["kv_lens"] = new_kvlens
@@ -1351,6 +1371,12 @@ class LancePipeline(BagelPipeline):
         )
 
         with torch.autocast(**autocast_kwargs):
+            # ``prepare_video_latent`` / ``prepare_vae_latent`` still return
+            # ``key_values_lens`` / ``packed_indexes`` / ``packed_key_value_indexes``
+            # but post-main-merge ``generate_image`` doesn't accept them — drop
+            # before unpacking via ``**gen_input_lat``.
+            for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
+                gen_input_lat.pop(_drop, None)
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
@@ -1366,13 +1392,11 @@ class LancePipeline(BagelPipeline):
                 cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=cfg_text_lat["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=cfg_text_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
+                # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
+                # (derived from ``cfg_text_past_key_values``).
                 cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=cfg_img_lat["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=cfg_img_lat["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=cfg_img_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_img_*`` index/lens kwargs removed — same as above.
                 frame_condition_token_indexes=frame_condition_token_indexes,
             )
 
@@ -1551,17 +1575,17 @@ class LancePipeline(BagelPipeline):
             curr_kvlen = ctx["kv_lens"][0]
             curr_rope = ctx["ropes"][0]
             seq_len = len(text_ids)
+            # ``forward_cache_update_text`` post-main-merge derives the
+            # remaining positions from ``past_key_values`` + the query
+            # length; the old ``packed_text_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` kwargs
+            # were dropped from its signature.
             inp = {
                 "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
                 "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
                 "packed_text_position_ids": torch.arange(
                     curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
                 ),
-                "packed_text_indexes": torch.arange(
-                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
-                ),
-                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
-                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
             }
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
@@ -1581,6 +1605,12 @@ class LancePipeline(BagelPipeline):
             for k, v in inp.items():
                 if torch.is_tensor(v):
                     inp[k] = v.to(self.device)
+            # ``prepare_vit_images`` still returns ``packed_indexes`` /
+            # ``packed_key_value_indexes`` / ``key_values_lens`` for
+            # historical reasons; ``forward_cache_update_vit`` post-main
+            # no longer accepts them — pop before unpacking.
+            for _drop in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                inp.pop(_drop, None)
             with torch.autocast(**autocast_kwargs):
                 ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
             ctx["kv_lens"] = new_kvlens
@@ -1676,6 +1706,12 @@ class LancePipeline(BagelPipeline):
         cfg_img_lat = cfg_text_lat
 
         with torch.autocast(**autocast_kwargs):
+            # ``prepare_video_latent`` / ``prepare_vae_latent`` still return
+            # ``key_values_lens`` / ``packed_indexes`` / ``packed_key_value_indexes``
+            # but post-main-merge ``generate_image`` doesn't accept them — drop
+            # before unpacking via ``**gen_input_lat``.
+            for _drop in ("key_values_lens", "packed_indexes", "packed_key_value_indexes"):
+                gen_input_lat.pop(_drop, None)
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"]
@@ -1691,13 +1727,11 @@ class LancePipeline(BagelPipeline):
                 cfg_renorm_min=cfg_renorm_min,
                 **gen_input_lat,
                 cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=cfg_text_lat["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=cfg_text_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
+                # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
+                # (derived from ``cfg_text_past_key_values``).
                 cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=cfg_img_lat["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=cfg_img_lat["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=cfg_img_lat["cfg_packed_key_value_indexes"],
+                # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
@@ -1777,6 +1811,11 @@ class LancePipeline(BagelPipeline):
         for k, v in gen_input_vit.items():
             if torch.is_tensor(v):
                 gen_input_vit[k] = v.to(self.device)
+        # Post-main-merge ``forward_cache_update_vit`` drops the
+        # legacy ``packed_indexes`` / ``packed_key_value_indexes`` /
+        # ``key_values_lens`` kwargs.
+        for _drop in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+            gen_input_vit.pop(_drop, None)
         with torch.autocast(**autocast_kwargs):
             gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
                 gen_context["past_key_values"], **gen_input_vit
@@ -1895,6 +1934,11 @@ class LancePipeline(BagelPipeline):
         for k, v in gen_input_vit.items():
             if torch.is_tensor(v):
                 gen_input_vit[k] = v.to(self.device)
+        # Post-main-merge ``forward_cache_update_vit`` drops the
+        # legacy ``packed_indexes`` / ``packed_key_value_indexes`` /
+        # ``key_values_lens`` kwargs.
+        for _drop in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+            gen_input_vit.pop(_drop, None)
         with torch.autocast(**autocast_kwargs):
             gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
                 gen_context["past_key_values"], **gen_input_vit
@@ -2003,11 +2047,12 @@ class LancePipeline(BagelPipeline):
             packed_start_tokens.append(nl_id)
             packed_query_position_ids.append(curr_position_id)
             curr += curr_kvlen
+        # ``Bagel.generate_text`` post-main-merge no longer accepts
+        # ``key_values_lens`` / ``packed_key_value_indexes`` — they're
+        # derived from ``past_key_values``.
         return {
             "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
             "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
-            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
         }
 
     def _x2t_raw_text_prefill(self, gen_context, text_str, autocast_kwargs):
@@ -2029,9 +2074,9 @@ class LancePipeline(BagelPipeline):
             "packed_text_position_ids": torch.arange(
                 curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
             ),
-            "packed_text_indexes": torch.arange(curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device),
-            "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
-            "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
+            # ``packed_text_indexes`` / ``packed_key_value_indexes`` /
+            # ``key_values_lens`` removed from ``forward_cache_update_text``
+            # post-main-merge (derived from ``past_key_values``).
         }
         with torch.autocast(**autocast_kwargs):
             gen_context["past_key_values"] = self.bagel.forward_cache_update_text(gen_context["past_key_values"], **inp)

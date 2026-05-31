@@ -1852,7 +1852,11 @@ class Bagel(nn.Module):
                 "num_branches": num_branches,
                 "seq_len": seq_len,
                 "batched_query_lens": packed_seqlens.repeat(num_branches),
-                "batched_position_ids": torch.cat(branches_pid),
+                # Concat along the *sequence* (last) dim — works for both
+                # scalar 1-D position ids ``(S,)`` and Lance's 3-D mRoPE
+                # ``(3, S)``.  Default ``dim=0`` collapses ``(3, S) + (3, S)``
+                # to ``(6, S)`` and breaks ``BagelRotaryEmbedding``.
+                "batched_position_ids": torch.cat(branches_pid, dim=-1),
                 "batched_text_indexes": torch.cat(
                     [packed_text_indexes + b_idx * seq_len for b_idx in range(num_branches)]
                 ),

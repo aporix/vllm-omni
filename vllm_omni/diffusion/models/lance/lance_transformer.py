@@ -1535,14 +1535,14 @@ class LanceBagel(Bagel):
                 "packed_text_indexes": packed_text_indexes,
             }
 
+        # ``Qwen2MoTForCausalLM.forward`` post-main-merge no longer accepts
+        # ``packed_query_indexes`` / ``key_values_lens`` /
+        # ``packed_key_value_indexes`` — derived internally now.
         output = self.language_model.forward(
             packed_query_sequence=packed_query_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
             past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=True,
             is_causal=False,
             **extra_inputs,

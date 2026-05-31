@@ -820,6 +820,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         custom = {}
         if think_text is not None:
             custom["think_text"] = think_text
+        # Mirror the PIL image into ``custom_output`` so callers reading via
+        # the orchestrator IPC boundary (which strips the bare ``output``
+        # field) can still recover the result.  ``video_frames`` already
+        # uses this pattern.
+        custom["image"] = img
 
         return DiffusionOutput(
             output=img,
