@@ -31,7 +31,7 @@ PR title must follow the project convention documented in `docs/contributing/REA
 ✗ [WIP] Add model                                ← WIP in title
 ```
 
-- [ ] **Title has valid prefix** — ✗ if missing prefix, wrong case, or WIP/Draft in title
+- [ ] **Title has valid prefix** — ✗ if missing prefix, wrong case, or WIP/Draft in title. For `[Model]` PRs, the title MUST also include the model identifier (e.g., `[Model] Add <ModelName> ...`). ⚠ if missing the model name.
 
 ---
 
@@ -98,9 +98,9 @@ PR title must follow the project convention documented in `docs/contributing/REA
   4. Dead branch guards — `if version > X` where X is always satisfied
   5. Unused parameters — `__init__` args never accessed
 - [ ] **Copy-paste detection:** no string constant defined in 3+ files, no cross-module validation duplication, no near-identical shape coercion fns
-- [ ] **Import hygiene:** no re-export-only imports, no module-level side effects without docs, no `import os` in function body when already at top
-- [ ] **Accuracy:** at least one test compares output against reference; audio = valid WAV at correct sample rate; determinism verified if seed claimed
-- [ ] **Performance:** hardware, software versions, warmup, and metrics (RTF, VRAM, RPS, latency) stated
+- [ ] **Import hygiene:** no re-export-only imports, no module-level side effects without docs, no `import os` in function body when already at top. Function-body imports are acceptable when the import is only reachable from a closure or factory return value (i.e., `import` would otherwise execute at module load even though the user may never trigger that path). Either lift to top-of-file or annotate with `# noqa: PLC0415`.
+- [ ] **Accuracy:** at least one test compares output against reference; audio = valid WAV at correct sample rate; determinism verified if seed claimed. ⚠ if missing and not explicitly deferred to a follow-up PR or RFC section; — if explicitly deferred (the deferral target SHOULD be linked in the PR body).
+- [ ] **Performance:** hardware, software versions, warmup, and metrics (RTF, VRAM, RPS, latency) stated. ⚠ if missing and not explicitly deferred; — if explicitly deferred.
 - [ ] **Benchmark settings:** model config (TP, PP, max_model_len, enforce_eager, quant), runtime config (batch, input/output spec), environment versions
 - [ ] **Benchmark script checked in + exact command line + pytest summary**
 
@@ -112,7 +112,7 @@ Diffusion models live under `vllm_omni/diffusion/`. In addition to the New Model
 
 - [ ] **Transformer adapter follows contract:** inherits from `nn.Module`, implements `load_weights()`, uses `vllm_omni.diffusion.attention.layer.Attention`
 - [ ] **Pipeline has both offline and online paths:** `forward()` for batch generation, streaming path for online serving
-- [ ] **Cache-DiT integration:** at least one acceleration (TeaCache, FBCache, etc.) is wired up
+- [ ] **Cache-DiT integration:** at least one acceleration (TeaCache, FBCache, etc.) is wired up. ✗ for new **top-level** pipelines. For **subclass** pipelines that inherit `__call__` from a parent where Cache-DiT is already absent, downgrade to ⚠ and recommend filing a follow-up issue against the parent pipeline family.
 - [ ] **Parallelism config:** TP/SP/USP/CFG-Parallel options exposed in pipeline config
 - [ ] **Docs table updated:** model added to `docs/models/supported_models.md` with correct metadata
 - [ ] **E2E test exists:** at least one test exercises the full generate path

@@ -21,9 +21,11 @@ Default to quick if unsure. Run full before marking a PR "ready for review."
 ### Step 1: Detect Base Branch
 
 ```bash
-BASE=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null)
-BASE=${BASE:-main}
-git diff --name-only ${BASE}...HEAD
+BASE_SHA=$(git merge-base HEAD origin/main 2>/dev/null \
+         || git merge-base HEAD main 2>/dev/null \
+         || echo origin/main)
+echo "diffing against ${BASE_SHA}"
+git diff --name-only ${BASE_SHA}...HEAD
 ```
 
 ### Step 2: Validate PR Title
@@ -43,6 +45,7 @@ Check the most recent commit message (or branch name if no commit yet) against t
 | `[Misc]` | Other changes (use sparingly) |
 
 ✗ if: missing prefix, wrong case (`[bugfix]`), or WIP/Draft in title.
+⚠ if: `[Model]` prefix without the model identifier (e.g., `[Model] Add new model` — should be `[Model] Add <ModelName> ...`).
 
 ### Step 3: Categorize the PR
 
@@ -53,6 +56,8 @@ Check the most recent commit message (or branch name if no commit yet) against t
 | `[Bugfix]` prefix or single-file fix | **Bug Fix** |
 | Perf/benchmark/throughput claims in commit msg or diff | **Performance** |
 | Everything else | **General** |
+
+If multiple rows apply (e.g., a diffusion model is also a new model), union the checklists.
 
 ### Step 4: Run Checklist
 
