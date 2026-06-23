@@ -520,7 +520,7 @@ class AsyncOmniEngine:
             return
 
         mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, Mapping) or not mm_data:
+        if not isinstance(mm_data, dict) or not mm_data:
             return
 
         from vllm.multimodal.hasher import MultiModalHasher
@@ -842,6 +842,14 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
+        if cache_backend in ("step_cache"):
+            return {
+                "step_cache_dit_enabled": True,
+                "velocity_sim_thresholds": [0.95, 0.93],
+                "velocity_skip_countdowns": [4, 2],
+                "step_cache_dit_min_history": 2,
+                "step_cache_dit_max_history": 2,
+            }
         return None
 
     @staticmethod
@@ -1019,6 +1027,7 @@ class AsyncOmniEngine:
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": {
                 "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
