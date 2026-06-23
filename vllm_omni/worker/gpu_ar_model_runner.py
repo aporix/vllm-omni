@@ -420,7 +420,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
             )
         except Exception:
-            logger.exception("Model runner-assisted full attention metadata hook failed; falling back.")
+            logger.exception("Model runner-assisted full attention metadata hook failed; ignoring request.")
             return None
         if request is None:
             return None
@@ -759,13 +759,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            num_computed_tokens_list = self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
+            num_scheduled_tokens_list = num_scheduled_tokens_np[:num_reqs].tolist()
 
             runner_assisted_full_attn_request = self._get_runner_assisted_full_attention_metadata_request(
                 req_ids=list(req_ids[:num_reqs]),
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs_padded,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
-                num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
+                num_computed_tokens=num_computed_tokens_list,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
             )
             runner_assisted_full_attn = runner_assisted_full_attn_request is not None
@@ -856,8 +858,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 positions=positions,
                 inputs_embeds=inputs_embeds,
                 req_ids=req_ids[:num_reqs],
-                num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
-                num_scheduled_tokens=[int(num_scheduled_tokens_np[i]) for i in range(num_reqs)],
+                num_computed_tokens=num_computed_tokens_list,
+                num_scheduled_tokens=num_scheduled_tokens_list,
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
             )
 

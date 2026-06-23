@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -205,6 +206,34 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def _voxcpm2_unified_decode_graph_admission_deferral_enabled(self) -> bool:
+        model_config = self.vllm_config.model_config
+        if getattr(model_config, "model_arch", None) != "VoxCPM2TalkerForConditionalGeneration":
+            return False
+
+        hf_config = getattr(model_config, "hf_config", None)
+        runtime_config = getattr(hf_config, "voxcpm2_runtime_config", None)
+        if isinstance(runtime_config, dict):
+            return bool(runtime_config.get("enable_unified_decode_graph", False))
+        return bool(getattr(runtime_config, "enable_unified_decode_graph", False))
+
+    def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
+        # VoxCPM2's full unified decode graph only applies to pure decode
+        # batches.  When a decode-ready request is already running, defer new
+        # waiting admissions for this scheduler tick so decode-only steps keep
+        # using the full unified graph path.
+        if not self._voxcpm2_unified_decode_graph_admission_deferral_enabled():
+            return False
+        if not self.waiting or not self.running:
+            return False
+
+        for request in self.running:
+            if getattr(request, "status", None) != RequestStatus.RUNNING or request.is_finished():
+                continue
+            if self._get_confirmed_num_computed_tokens(request) >= request.num_prompt_tokens:
+                return True
+        return False
+
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -222,9 +251,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
 
+        defer_waiting_for_unified_decode = self._should_defer_waiting_for_unified_decode_graph()
+        original_waiting = None
+        if defer_waiting_for_unified_decode:
+            original_waiting = self.waiting
+            self.waiting = create_request_queue(self.policy)
+
         try:
             scheduler_output = super().schedule()
         finally:
+            if original_waiting is not None:
+                deferred_waiting = list(self.waiting)
+                if deferred_waiting:
+                    original_waiting.prepend_requests(deferred_waiting)
+                self.waiting = original_waiting
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(

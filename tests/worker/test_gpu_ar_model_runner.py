@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -50,6 +51,71 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
 
     assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
     assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+
+
+def test_runner_assisted_full_attention_metadata_request_is_opt_in():
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = object()
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=16)
+
+    request = runner._get_runner_assisted_full_attention_metadata_request(
+        req_ids=["r1", "r2"],
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        num_computed_tokens=[5, 6],
+        max_num_scheduled_tokens=1,
+    )
+
+    assert request is None
+
+
+def test_runner_assisted_full_attention_metadata_request_and_context_hooks():
+    calls = []
+
+    class Model:
+        def get_runner_assisted_full_attention_metadata_request(self, **kwargs):
+            calls.append(("request", kwargs))
+            return 12, True
+
+        def set_runner_assisted_full_attention_metadata_context(self, **kwargs):
+            calls.append(("context", kwargs))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
+
+    request = runner._get_runner_assisted_full_attention_metadata_request(
+        req_ids=["r1", "r2"],
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        num_computed_tokens=[5, 6],
+        max_num_scheduled_tokens=1,
+    )
+    context_enabled = runner._set_runner_assisted_full_attention_metadata_context(
+        enabled=True,
+        num_reqs=2,
+    )
+    context_disabled = runner._set_runner_assisted_full_attention_metadata_context(enabled=False)
+
+    assert request == (8, True)
+    assert context_enabled
+    assert context_disabled
+    assert calls == [
+        (
+            "request",
+            {
+                "req_ids": ["r1", "r2"],
+                "num_reqs": 2,
+                "num_scheduled_tokens": [1, 1],
+                "num_computed_tokens": [5, 6],
+                "max_num_scheduled_tokens": 1,
+            },
+        ),
+        ("context", {"enabled": True, "num_reqs": 2}),
+        ("context", {"enabled": False, "num_reqs": 0}),
+    ]
 
 
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])

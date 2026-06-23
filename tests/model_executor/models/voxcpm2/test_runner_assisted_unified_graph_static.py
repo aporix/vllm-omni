@@ -60,6 +60,13 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
 
     assert "_voxcpm2_compile_without_inductor_cudagraphs" in source
     assert "def _compile_without_inductor_cudagraphs" not in source
+    assert "_voxcpm2_unwrap_torch_compile" in source
+    assert "_orig_mod" in source
+    compile_source = source[source.index("def _voxcpm2_compile_without_inductor_cudagraphs") :]
+    compile_source = compile_source[: compile_source.index("def _setup_torch_compile")]
+    assert "torch._inductor.config" not in compile_source
+    assert '"triton.cudagraphs": False' in compile_source
+    assert '"triton.cudagraph_trees": False' in compile_source
 
     assert "self._enable_unified_decode_graph=(use_cuda_graph" in compact_source
     assert "andnotself._deterministic_cfm_noise" in compact_source
@@ -67,16 +74,34 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
 
     unified_source = source[source.index("def _forward_unified_decode") :]
     unified_source = unified_source[: unified_source.index("# -------------------- vllm hooks")]
-    assert "except Exception:" in unified_source
-    assert "_forward_unified_decode_fallback(inputs_embeds, positions, num_reqs)" in unified_source
-    assert "capture_failed" in compact_source
+    assert "except Exception:" not in unified_source
+    assert "_failed_unified_graph_sizes" not in source
+    assert "self._enable_unified_decode_graph = False" not in unified_source
+    assert "_forward_unified_decode_fallback" not in source
+    assert "capture_failed" not in compact_source
+    assert "record_fallback" not in source
+    assert "fallbacks" not in source
+
+    capture_source = source[source.index("def _capture_unified_decode_graph") :]
+    capture_source = capture_source[: capture_source.index("def _unified_decode_graph_skip_reason")]
+    assert "_voxcpm2_compile_unified_capture_module" in capture_source
+    graph_body = capture_source[capture_source.index("with torch.cuda.graph") :]
+    assert "g.cfm_noise.normal_()" not in graph_body
+    assert "g.cfm_noise.normal_()" in unified_source
+
+    pre_capture_source = source[source.index("def _pre_capture_unified_graphs") :]
+    pre_capture_source = pre_capture_source[: pre_capture_source.index("def _maybe_log_unified_graph_stats")]
+    assert "_failed_unified_graph_sizes" not in pre_capture_source
+    assert "except Exception:" not in pre_capture_source
+    assert "self._enable_unified_decode_graph = False" not in pre_capture_source
 
 
 def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     source = TALKER.read_text()
     compact_source = "".join(source.split())
 
-    assert "enable_runner_assisted_unified_decode_graph" in source
+    assert "enable_runner_assisted_unified_decode_graph" not in source
+    assert "allow_unified_decode_graph_batch_attention" not in source
     assert "get_runner_assisted_full_attention_metadata_request" in source
     assert "set_runner_assisted_full_attention_metadata_context" in source
     assert "_runner_assisted_unified_decode_graph_active" in source
@@ -89,12 +114,14 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     assert "override_forward_context" in capture_source
     assert "_nullify_volatile_metadata" in capture_source
     assert "capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))" in capture_source
-    assert "size>1andself._runtime_config.enable_runner_assisted_unified_decode_graph" in compact_source
+    assert "ifsize>1:continue" in compact_source
     forward_source = source[source.index("def _forward_unified_decode") :]
     forward_source = forward_source[: forward_source.index("# -------------------- vllm hooks")]
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
     assert "self._unified_graphs[graph_size]" in forward_source
-    assert "g.input_embeds[num_reqs:graph_size].zero_()" in forward_source
+    assert "g.input_embeds[num_reqs:graph_size].zero_()" not in forward_source
+    assert "padded rows as valid duplicates" in forward_source
+    assert "g.input_embeds[last : last + 1].expand" in forward_source
     assert "ifnum_reqs>1andnotself._runner_assisted_unified_decode_graph_active" in compact_source
     assert "andnotcfg.enable_runner_assisted_unified_decode_graph" not in compact_source
     needs_source = source[source.index("def get_runner_assisted_full_attention_metadata_request") :]
@@ -110,5 +137,6 @@ def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
     assert "enable_unified_decode_graph: true" in source
     assert "unified_decode_graph_max_batch_size: 8" in source
     assert "unified_decode_graph_pre_capture_sizes: 1,2,4,8" in source
-    assert "enable_runner_assisted_unified_decode_graph: true" in source
-    assert "allow_unified_decode_graph_batch_attention: true" in source
+    assert "enable_runner_assisted_unified_decode_graph" not in source
+    assert "allow_unified_decode_graph_batch_attention" not in source
+    assert "decode_graph_capture_policy" not in source

@@ -40,12 +40,9 @@ stages:
         enable_loc_dit_zero_dt_cache: true
         enable_loc_dit_skip_qkv_contig: true
         enable_loc_dit_reduce_overhead_no_cg: true
-        decode_graph_capture_policy: power2
         enable_unified_decode_graph: true
         unified_decode_graph_max_batch_size: 8
         unified_decode_graph_pre_capture_sizes: 1,2,4,8
-        enable_runner_assisted_unified_decode_graph: true
-        allow_unified_decode_graph_batch_attention: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
