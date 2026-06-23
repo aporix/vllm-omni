@@ -2082,17 +2082,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             self._unified_graph_stats.record_skip(unified_skip_reason)
             self._maybe_log_unified_graph_stats()
 
-        if (
-            not self._enable_unified_decode_graph
-            and can_use_graph
+        use_segmented_decode_graph = (
+            can_use_graph
             and is_all_decode
             and num_reqs <= self._max_cached_graphs
-        ):
-            use_scaffold_graph = self._should_use_decode_graph(num_reqs)
-        else:
-            use_scaffold_graph = False
+            and (not self._enable_unified_decode_graph or unified_skip_reason is not None)
+            and self._should_use_decode_graph(num_reqs)
+        )
 
-        if use_scaffold_graph:
+        if use_segmented_decode_graph:
             self._perf.start("scaffold_fwd")
             if num_reqs not in self._scaffold_graphs:
                 self._scaffold_graphs[num_reqs] = self._capture_graph(self.model, num_reqs, "scaffold")
@@ -2178,7 +2176,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             residual_batch_size = batch_in.shape[0]
             use_residual_graph = (
                 self._enable_cuda_graph
-                and not self._enable_unified_decode_graph
+                and use_segmented_decode_graph
                 and is_all_decode
                 and graph_ready
                 and residual_batch_size == num_reqs  # 1 token per request

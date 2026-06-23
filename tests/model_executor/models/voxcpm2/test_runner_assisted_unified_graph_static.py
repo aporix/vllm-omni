@@ -130,6 +130,19 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     assert "_should_use_decode_graph(num_reqs)" not in needs_source
 
 
+def test_voxcpm2_unified_skip_preserves_segmented_decode_graphs():
+    source = TALKER.read_text()
+    compact_source = "".join(source.split())
+    forward_source = source[source.index("def forward(") :]
+    forward_source = forward_source[: forward_source.index("# -------------------- prefill / decode helpers")]
+
+    assert "use_segmented_decode_graph" in forward_source
+    assert "unified_skip_reasonisnotNone" in compact_source
+    assert "notself._enable_unified_decode_graphorunified_skip_reasonisnotNone" in compact_source
+    assert "ifuse_segmented_decode_graph:" in compact_source
+    assert "anduse_segmented_decode_graph" in compact_source
+
+
 def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
     source = DEPLOY.read_text()
 
